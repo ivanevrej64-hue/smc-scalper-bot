@@ -1,327 +1,343 @@
 
 import os
 import logging
+from datetime import timedelta
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from smartmoneyconcepts import smc
 from twelvedata import TDClient
 
-# ---------------- CONFIG ----------------
+# --------------------------------------------------
+# НАСТРОЙКИ
+# --------------------------------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="SMC Trading Signal API")
+app = FastAPI(
+    title="SMC Signal Bot",
+    version="1.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=["*"],  # В production ограничить своим доменом
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
-TWELVEDATA_KEY = os.environ.get("TWELVEDATA_KEY")
-td = TDClient(apikey=TWELVEDATA_KEY) if TWELVEDATA_KEY else None
+TWELVEDATA_KEY = os.getenv("TWELVEDATA_KEY")
 
-ALLOWED_TF = {
-    "1min", "5min", "15min", "30min",
-    "45min", "1h", "2h", "4h"
+ALLOWED_PAIRS = {
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "AUD/USD",
+    "USD/CHF",
+    "EUR/JPY",
 }
 
-LOOKBACK = 3
-OUTPUT_SIZE = 200
+TIMEFRAMES = {
+    "1min": timedelta(minutes=1),
+    "5min": timedelta(minutes=5),
+    "15min": timedelta(minutes=15),
+    "1h": timedelta(hours=1),
+}
+
+SWING_LENGTH = 5
+CANDLE_LIMIT = 150
+CANDLE_SAFETY_SECONDS = 3
 
 
-# ---------------- REQUEST MODEL ----------------
+# --------------------------------------------------
+# МОДЕЛЬ ЗАПРОСА
+# --------------------------------------------------
 
 class SignalRequest(BaseModel):
-    pair: str = Field(default="EUR/USD", min_length=3, max_length=30)
-    timeframe: str = "1min"
+    pair: str = Field(default="EUR/USD")
+    timeframe: str = Field(default="1min")
 
 
-# ---------------- MARKET DATA ----------------
+# --------------------------------------------------
+# ПОЛУЧЕНИЕ ДАННЫХ TWELVE DATA
+# --------------------------------------------------
 
-def load_ohlc(pair: str, timeframe: str):
+def get_market_data(pair: str, timeframe: str) -> pd.DataFrame:
 
-    if td is None:
-        raise ValueError("TWELVEDATA_KEY не задан")
+    if not TWELVEDATA_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Не задан TWELVEDATA_KEY в переменных окружения"
+        )
 
     try:
-        ts = td.time_series(
+        td = TDClient(apikey=TWELVEDATA_KEY)
+
+        response = td.time_series(
             symbol=pair,
             interval=timeframe,
-            outputsize=OUTPUT_SIZE
+            outputsize=CANDLE_LIMIT,
+            timezone="UTC"
         )
 
-        df = ts.as_pandas()
+        df = response.as_pandas()
 
-    except Exception as e:
-        logger.exception("Twelve Data API error")
-        raise ValueError(f"Ошибка получения котировок: {str(e)}")
+        if df is None or df.empty:
+            raise HTTPException(
+                status_code=502,
+                detail="Twelve Data не вернул свечи"
+            )
 
-    if df is None or df.empty:
-        raise ValueError("Twelve Data не вернул данные")
+        df.columns = [str(col).lower() for col in df.columns]
 
-    # Приводим названия столбцов к нижнему регистру
-    df.columns = [str(c).lower() for c in df.columns]
+        # Нормализация времени
+        if "datetime" in df.columns:
+            df["datetime"] = pd.to_datetime(
+                df["datetime"],
+                utc=True,
+                errors="coerce"
+            )
+            df = df.set_index("datetime")
+        else:
+            df.index = pd.to_datetime(
+                df.index,
+                utc=True,
+                errors="coerce"
+            )
 
-    required = ["open", "high", "low", "close"]
+        df = df.sort_index()
+        df = df[~df.index.isna()]
+        df = df[~df.index.duplicated(keep="last")]
 
-    for column in required:
-        if column not in df.columns:
-            raise ValueError(f"Отсутствует столбец {column}")
+        required = ["open", "high", "low", "close"]
 
-    # Старые свечи должны идти первыми
-    df = df.sort_index()
-
-    # Если объём отсутствует, добавляем нулевой
-    if "volume" not in df.columns:
-        df["volume"] = 0
-
-    # Приведение значений к числовому формату
-    for column in ["open", "high", "low", "close", "volume"]:
-        df[column] = pd.to_numeric(
-            df[column], errors="coerce"
-        )
-
-    df = df.dropna(
-        subset=["open", "high", "low", "close"]
-    )
-
-    # Удаляем последнюю незакрытую свечу
-    if len(df) > 1:
-        df = df.iloc[:-1]
-
-    df = df[["open", "high", "low", "close", "volume"]]
-
-    # Индекс 0..N-1 для SMC
-    df = df.reset_index(drop=True)
-
-    if len(df) < 30:
-        raise ValueError("Недостаточно свечей для анализа")
-
-    return df
-
-
-# ---------------- SMC ANALYSIS ----------------
-
-def analyze_market(df):
-
-    swing_hl = smc.swing_highs_lows(
-        df,
-        swing_length=5
-    )
-
-    bos_choch = smc.bos_choch(
-        df,
-        swing_hl
-    )
-
-    fvg = smc.fvg(df)
-
-    last_idx = len(df) - 1
-    last = df.iloc[last_idx]
-
-    signal = "WAIT"
-    reason = "Нет подтверждённого торгового события"
-
-    bias = "нет данных"
-    last_event = None
-
-    # ---------------- BOS / CHoCH ----------------
-
-    events = bos_choch.copy()
-
-    events["BrokenIndex"] = pd.to_numeric(
-        events["BrokenIndex"],
-        errors="coerce"
-    )
-
-    events = events[
-        events["BrokenIndex"].notna()
-        & (events["BrokenIndex"] <= last_idx)
-    ]
-
-    if not events.empty:
-
-        events = events.sort_values("BrokenIndex")
-
-        ev = events.iloc[-1]
-
-        bos = ev["BOS"]
-        choch = ev["CHOCH"]
-
-        direction = None
-        kind = None
-
-        if pd.notna(bos) and bos in (1, -1):
-            direction = int(bos)
-            kind = "BOS"
-
-        elif pd.notna(choch) and choch in (1, -1):
-            direction = int(choch)
-            kind = "CHoCH"
-
-        if direction is not None:
-
-            broken_index = int(ev["BrokenIndex"])
-            age = last_idx - broken_index
-
-            bias = "бычий" if direction == 1 else "медвежий"
-
-            last_event = {
-                "type": kind,
-                "dir": direction,
-                "candles_ago": age
-            }
-
-            if 0 <= age < LOOKBACK:
-
-                if direction == 1:
-                    signal = "CALL"
-                    reason = f"Бычий {kind}, {age} свечей назад"
-
-                else:
-                    signal = "PUT"
-                    reason = f"Медвежий {kind}, {age} свечей назад"
-
-    # ---------------- FVG RETEST ----------------
-
-    if signal == "WAIT":
-
-        active = fvg[
-            fvg["FVG"].notna()
-            & fvg["MitigatedIndex"].isna()
-            & (fvg.index < last_idx - 1)
-        ]
-
-        # Проверяем зоны от самой новой к старой
-        if not active.empty:
-
-            for idx in reversed(active.index.tolist()):
-
-                zone = active.loc[idx]
-
-                top = float(zone["Top"])
-                bottom = float(zone["Bottom"])
-                direction = int(zone["FVG"])
-
-                # Проверка фактического пересечения свечи с зоной
-                overlaps = (
-                    last["low"] <= top
-                    and last["high"] >= bottom
+        for column in required:
+            if column not in df.columns:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"В данных отсутствует колонка {column}"
                 )
 
-                if not overlaps:
-                    continue
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce"
+            )
 
-                bullish_candle = last["close"] > last["open"]
-                bearish_candle = last["close"] < last["open"]
+        df = df.dropna(subset=required)
 
-                if direction == 1:
+        # Проверяем корректность OHLC
+        df = df[
+            (df["high"] >= df["low"]) &
+            (df["high"] >= df["open"]) &
+            (df["high"] >= df["close"]) &
+            (df["low"] <= df["open"]) &
+            (df["low"] <= df["close"])
+        ]
 
-                    if bullish_candle and last["close"] > bottom:
-                        signal = "CALL"
-                        reason = "Подтверждённый отбой от бычьего FVG"
-                        break
+        # Исключаем незакрытые свечи
+        duration = TIMEFRAMES[timeframe]
+        now = pd.Timestamp.now(tz="UTC")
+        cutoff = now - duration - timedelta(
+            seconds=CANDLE_SAFETY_SECONDS
+        )
 
-                elif direction == -1:
+        df = df[df.index <= cutoff]
 
-                    if bearish_candle and last["close"] < top:
-                        signal = "PUT"
-                        reason = "Подтверждённый отбой от медвежьего FVG"
-                        break
+        if len(df) < 30:
+            raise HTTPException(
+                status_code=502,
+                detail="Недостаточно закрытых свечей для анализа"
+            )
 
-            if signal == "WAIT":
-                reason = "Нет подтверждённого отбоя от FVG"
+        return df.tail(CANDLE_LIMIT)
 
-    return {
-        "signal": signal,
-        "reason": f"{reason} | Тренд: {bias}",
-        "price": float(last["close"]),
-        "debug": {
-            "last_event": last_event,
-            "candles": len(df)
-        }
-    }
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.exception("Ошибка получения рыночных данных")
+
+        raise HTTPException(
+            status_code=502,
+            detail="Не удалось получить данные Twelve Data"
+        )
 
 
-# ---------------- API ENDPOINT ----------------
+# --------------------------------------------------
+# ПОИСК ПОДТВЕРЖДЕННЫХ SWING HIGH / SWING LOW
+# --------------------------------------------------
+
+def find_confirmed_swings(df: pd.DataFrame, length: int):
+
+    highs = df["high"].to_numpy()
+    lows = df["low"].to_numpy()
+
+    swing_highs = []
+    swing_lows = []
+
+    # Последние length свечей не используются:
+    # у них еще нет полного подтверждения справа.
+    for i in range(length, len(df) - length):
+
+        left = i - length
+        right = i + length + 1
+
+        high_window = highs[left:right]
+        low_window = lows[left:right]
+
+        if highs[i] == max(high_window):
+            swing_highs.append((i, float(highs[i])))
+
+        if lows[i] == min(low_window):
+            swing_lows.append((i, float(lows[i])))
+
+    return swing_highs, swing_lows
+
+
+# --------------------------------------------------
+# SMC АНАЛИЗ
+# --------------------------------------------------
+
+def analyze_smc(df: pd.DataFrame):
+
+    if len(df) < 30:
+        return "WAIT", "Недостаточно данных"
+
+    last = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    swing_highs, swing_lows = find_confirmed_swings(
+        df,
+        SWING_LENGTH
+    )
+
+    signal = "WAIT"
+    reason = "Нет подтвержденного торгового условия"
+
+    # 1. BOS — пробой подтвержденного Swing High
+    if swing_highs:
+        swing_high_index, swing_high = swing_highs[-1]
+
+        bullish_break = (
+            previous["close"] <= swing_high
+            and last["close"] > swing_high
+        )
+
+        if bullish_break:
+            signal = "CALL"
+            reason = "Бычий BOS: закрытие свечи выше подтвержденного Swing High"
+
+    # 2. BOS — пробой подтвержденного Swing Low
+    if signal == "WAIT" and swing_lows:
+        swing_low_index, swing_low = swing_lows[-1]
+
+        bearish_break = (
+            previous["close"] >= swing_low
+            and last["close"] < swing_low
+        )
+
+        if bearish_break:
+            signal = "PUT"
+            reason = "Медвежий BOS: закрытие свечи ниже подтвержденного Swing Low"
+
+    # 3. FVG — трехсвечная модель.
+    # Она становится известна только после закрытия последней свечи.
+    if signal == "WAIT" and len(df) >= 3:
+
+        candle_2 = df.iloc[-3]
+
+        bullish_fvg = (
+            last["low"] > candle_2["high"]
+            and last["close"] > last["open"]
+        )
+
+        bearish_fvg = (
+            last["high"] < candle_2["low"]
+            and last["close"] < last["open"]
+        )
+
+        if bullish_fvg:
+            signal = "CALL"
+            reason = "Образован бычий FVG на закрытой свече"
+
+        elif bearish_fvg:
+            signal = "PUT"
+            reason = "Образован медвежий FVG на закрытой свече"
+
+    return signal, reason
+
+
+# --------------------------------------------------
+# API: ПОЛУЧЕНИЕ СИГНАЛА
+# --------------------------------------------------
 
 @app.post("/api/signal")
 def get_signal(req: SignalRequest):
 
-    if td is None:
-        raise HTTPException(
-            status_code=500,
-            detail="TWELVEDATA_KEY не задан"
-        )
-
     pair = req.pair.strip().upper()
+    timeframe = req.timeframe.strip()
 
-    if not pair:
+    if pair not in ALLOWED_PAIRS:
         raise HTTPException(
             status_code=400,
-            detail="Укажите валютную пару"
+            detail="Эта валютная пара не поддерживается"
         )
 
-    if req.timeframe not in ALLOWED_TF:
+    if timeframe not in TIMEFRAMES:
         raise HTTPException(
             status_code=400,
-            detail=f"Недопустимый timeframe: {sorted(ALLOWED_TF)}"
+            detail="Недопустимый таймфрейм"
         )
 
-    try:
+    df = get_market_data(pair, timeframe)
 
-        df = load_ohlc(pair, req.timeframe)
-
-        result = analyze_market(df)
-
-        result["pair"] = pair
-        result["timeframe"] = req.timeframe
-
-        return result
-
-    except ValueError as e:
-
-        raise HTTPException(
-            status_code=502,
-            detail=str(e)
-        )
-
-    except Exception as e:
-
-        logger.exception("Signal analysis error")
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Ошибка анализа: {str(e)}"
-        )
-
-
-# ---------------- HEALTH CHECK ----------------
-
-@app.get("/")
-def health():
+    signal, reason = analyze_smc(df)
 
     return {
-        "status": "ok",
-        "service": "SMC Trading Signal API",
-        "twelvedata": td is not None
+        "signal": signal,
+        "reason": reason,
+        "pair": pair,
+        "timeframe": timeframe,
+        "price": float(df["close"].iloc[-1]),
+        "candle_time": df.index[-1].isoformat(),
+        "candles_used": len(df),
+        "strategy": "SMC",
+        "strategy_version": "1.0.0"
     }
 
 
-# ---------------- START SERVER ----------------
+# --------------------------------------------------
+# ПРОВЕРКА РАБОТЫ СЕРВЕРА
+# --------------------------------------------------
+
+@app.get("/")
+def health():
+    return {
+        "status": "ok",
+        "service": "SMC Signal Bot",
+        "version": "1.0.0"
+    }
+
+
+@app.get("/api/health")
+def api_health():
+    return {
+        "status": "online",
+        "twelvedata_key_configured": bool(TWELVEDATA_KEY)
+    }
+
+
+# --------------------------------------------------
+# ЛОКАЛЬНЫЙ ЗАПУСК
+# --------------------------------------------------
 
 if __name__ == "__main__":
-
     import uvicorn
 
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000
+        port=int(os.getenv("PORT", 8000))
     )
