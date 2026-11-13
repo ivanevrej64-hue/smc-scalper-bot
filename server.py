@@ -20,6 +20,8 @@ td = TDClient(apikey=TWELVEDATA_KEY) if TWELVEDATA_KEY else None
 
 ALLOWED_TF = {"1min", "5min", "15min", "30min", "45min", "1h", "2h", "4h"}
 
+LOOKBACK = 3  # сколько последних закрытых свечей считаем "свежим" событием
+
 
 class SignalRequest(BaseModel):
     pair: str = "EUR/USD"
@@ -72,22 +74,28 @@ def get_signal(req: SignalRequest):
         last = df.iloc[last_idx]
 
         signal = "WAIT"
-        reason = "Поиск быстрого импульса..."
+        reason = "Нет свежего пробоя структуры или отбоя от FVG"
 
-        # 1. Структура: ищем пробой, произошедший именно на последней свече
-        broken_now = bos_choch[bos_choch["BrokenIndex"] == last_idx]
-        if not broken_now.empty:
-            row = broken_now.iloc[-1]
-            if row["BOS"] == 1:
-                signal, reason = "CALL", "Бычий BOS. Импульс вверх."
-            elif row["BOS"] == -1:
-                signal, reason = "PUT", "Медвежий BOS. Импульс вниз."
-            elif row["CHOCH"] == 1:
-                signal, reason = "CALL", "Бычий CHoCH. Разворот вверх."
-            elif row["CHOCH"] == -1:
-                signal, reason = "PUT", "Медвежий CHoCH. Разворот вниз."
+        # --- Структура: последний пробой и его давность ---
+        events = bos_choch[bos_choch["BrokenIndex"].notna()].copy()
+        last_event = None
+        bias = "нет данных"
+        if not events.empty:
+            events = events.sort_values("BrokenIndex")
+            ev = events.iloc[-1]
+            age = last_idx - int(ev["BrokenIndex"])
+            direction = ev["BOS"] if ev["BOS"] in (1, -1) else ev["CHOCH"]
+            kind = "BOS" if ev["BOS"] in (1, -1) else "CHoCH"
+            bias = "бычий" if direction == 1 else "медвежий"
+            last_event = {"type": kind, "dir": int(direction), "candles_ago": age}
 
-        # 2. Если пробоя нет, ищем отбой от последнего неотработанного FVG
+            if age < LOOKBACK:
+                if direction == 1:
+                    signal, reason = "CALL", f"Бычий {kind} ({age} св. назад)"
+                else:
+                    signal, reason = "PUT", f"Медвежий {kind} ({age} св. назад)"
+
+        # --- FVG: ретест зоны, если свежего пробоя нет ---
         if signal == "WAIT":
             active = fvg[
                 fvg["FVG"].notna()
@@ -98,17 +106,19 @@ def get_signal(req: SignalRequest):
                 zone = active.iloc[-1]
                 bullish_candle = last["close"] > last["open"]
                 bearish_candle = last["close"] < last["open"]
-
                 if zone["FVG"] == 1 and last["low"] <= zone["Top"] and bullish_candle:
-                    signal, reason = "CALL", "Отбой от бычьего FVG."
+                    signal, reason = "CALL", "Отбой от бычьего FVG"
                 elif zone["FVG"] == -1 and last["high"] >= zone["Bottom"] and bearish_candle:
-                    signal, reason = "PUT", "Отбой от медвежьего FVG."
+                    signal, reason = "PUT", "Отбой от медвежьего FVG"
+                else:
+                    reason += f" | Активный FVG: {'бычий' if zone['FVG'] == 1 else 'медвежий'}"
 
         return {
             "signal": signal,
-            "reason": reason,
+            "reason": f"{reason} | Тренд: {bias}",
             "pair": req.pair,
             "price": float(last["close"]),
+            "debug": {"last_event": last_event, "candles": len(df)},
         }
 
     except HTTPException:
