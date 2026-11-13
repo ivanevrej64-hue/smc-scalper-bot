@@ -1,13 +1,17 @@
 
 import os
+import math
 import logging
 from datetime import timedelta
 
+import numpy as np
 import pandas as pd
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from twelvedata import TDClient
+
 
 # ==================================================
 # CONFIGURATION
@@ -16,7 +20,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -53,10 +57,44 @@ MIN_SCORE = 70
 
 
 # ==================================================
+# JSON SAFE CONVERSION
+# ==================================================
+
+def make_json_safe(value):
+
+    if isinstance(value, dict):
+        return {
+            str(key): make_json_safe(val)
+            for key, val in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [
+            make_json_safe(item)
+            for item in value
+        ]
+
+    if isinstance(value, np.ndarray):
+        return make_json_safe(value.tolist())
+
+    if isinstance(value, np.generic):
+        return make_json_safe(value.item())
+
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+
+    return value
+
+
+# ==================================================
 # REQUEST MODEL
 # ==================================================
 
 class SignalRequest(BaseModel):
+
     pair: str = Field(default="EUR/USD")
     timeframe: str = Field(default="1min")
 
@@ -74,6 +112,7 @@ def get_market_data(pair: str, timeframe: str) -> pd.DataFrame:
         )
 
     try:
+
         td = TDClient(apikey=TWELVEDATA_KEY)
 
         response = td.time_series(
@@ -91,16 +130,23 @@ def get_market_data(pair: str, timeframe: str) -> pd.DataFrame:
                 detail=f"Нет данных: {pair} {timeframe}"
             )
 
-        df.columns = [str(c).lower() for c in df.columns]
+        df.columns = [
+            str(c).lower()
+            for c in df.columns
+        ]
 
         if "datetime" in df.columns:
+
             df["datetime"] = pd.to_datetime(
                 df["datetime"],
                 utc=True,
                 errors="coerce"
             )
+
             df = df.set_index("datetime")
+
         else:
+
             df.index = pd.to_datetime(
                 df.index,
                 utc=True,
@@ -108,12 +154,19 @@ def get_market_data(pair: str, timeframe: str) -> pd.DataFrame:
             )
 
         df = df.sort_index()
-        df = df[~df.index.isna()]
-        df = df[~df.index.duplicated(keep="last")]
 
-        required = ["open", "high", "low", "close"]
+        df = df[~df.index.isna()]
+
+        df = df[
+            ~df.index.duplicated(keep="last")
+        ]
+
+        required = [
+            "open", "high", "low", "close"
+        ]
 
         for col in required:
+
             if col not in df.columns:
                 raise HTTPException(
                     status_code=502,
@@ -125,7 +178,9 @@ def get_market_data(pair: str, timeframe: str) -> pd.DataFrame:
                 errors="coerce"
             )
 
-        df = df.dropna(subset=required)
+        df = df.dropna(
+            subset=required
+        )
 
         df = df[
             (df["high"] >= df["low"]) &
@@ -136,18 +191,25 @@ def get_market_data(pair: str, timeframe: str) -> pd.DataFrame:
         ]
 
         # Используем только закрытые свечи
+
         cutoff = (
             pd.Timestamp.now(tz="UTC")
             - TIMEFRAMES[timeframe]
             - timedelta(seconds=CANDLE_SAFETY_SECONDS)
         )
 
-        df = df[df.index <= cutoff]
+        df = df[
+            df.index <= cutoff
+        ]
 
         if len(df) < 60:
+
             raise HTTPException(
                 status_code=502,
-                detail=f"Недостаточно закрытых свечей: {pair} {timeframe}"
+                detail=(
+                    f"Недостаточно закрытых свечей: "
+                    f"{pair} {timeframe}"
+                )
             )
 
         return df.tail(CANDLE_LIMIT)
@@ -156,7 +218,12 @@ def get_market_data(pair: str, timeframe: str) -> pd.DataFrame:
         raise
 
     except Exception:
-        logger.exception("Ошибка получения данных %s %s", pair, timeframe)
+
+        logger.exception(
+            "Ошибка получения данных %s %s",
+            pair,
+            timeframe
+        )
 
         raise HTTPException(
             status_code=502,
@@ -168,7 +235,10 @@ def get_market_data(pair: str, timeframe: str) -> pd.DataFrame:
 # CONFIRMED SWINGS
 # ==================================================
 
-def find_confirmed_swings(df, length=SWING_LENGTH):
+def find_confirmed_swings(
+    df,
+    length=SWING_LENGTH
+):
 
     highs = df["high"].to_numpy()
     lows = df["low"].to_numpy()
@@ -176,16 +246,30 @@ def find_confirmed_swings(df, length=SWING_LENGTH):
     swing_highs = []
     swing_lows = []
 
-    for i in range(length, len(df) - length):
+    for i in range(
+        length,
+        len(df) - length
+    ):
 
-        high_window = highs[i-length:i+length+1]
-        low_window = lows[i-length:i+length+1]
+        high_window = highs[
+            i-length:i+length+1
+        ]
+
+        low_window = lows[
+            i-length:i+length+1
+        ]
 
         if highs[i] == max(high_window):
-            swing_highs.append((i, float(highs[i])))
+
+            swing_highs.append(
+                (i, float(highs[i]))
+            )
 
         if lows[i] == min(low_window):
-            swing_lows.append((i, float(lows[i])))
+
+            swing_lows.append(
+                (i, float(lows[i]))
+            )
 
     return swing_highs, swing_lows
 
@@ -213,16 +297,24 @@ def analyze_h1(df):
     slow = float(ema50.iloc[-1])
 
     if price > fast > slow:
+
         return {
             "signal": "CALL",
-            "reason": "Бычье направление: цена выше EMA20, EMA20 выше EMA50",
+            "reason": (
+                "Бычье направление: цена выше EMA20, "
+                "EMA20 выше EMA50"
+            ),
             "score": 20
         }
 
     if price < fast < slow:
+
         return {
             "signal": "PUT",
-            "reason": "Медвежье направление: цена ниже EMA20, EMA20 ниже EMA50",
+            "reason": (
+                "Медвежье направление: цена ниже EMA20, "
+                "EMA20 ниже EMA50"
+            ),
             "score": 20
         }
 
@@ -242,6 +334,7 @@ def analyze_m15(df):
     swing_highs, swing_lows = find_confirmed_swings(df)
 
     if not swing_highs or not swing_lows:
+
         return {
             "signal": "WAIT",
             "structure": "NONE",
@@ -255,35 +348,26 @@ def analyze_m15(df):
     high_level = swing_highs[-1][1]
     low_level = swing_lows[-1][1]
 
-    bullish_break = (
+    bullish_break = bool(
         previous["close"] <= high_level
         and last["close"] > high_level
     )
 
-    bearish_break = (
+    bearish_break = bool(
         previous["close"] >= low_level
         and last["close"] < low_level
     )
 
-    if bullish_break and not bearish_break:
-        return {
-            "signal": "CALL",
-            "structure": "BOS",
-            "reason": "Закрытие свечи выше подтвержденного Swing High",
-            "score": 25
-        }
+    recent_highs = [
+        x[1] for x in swing_highs[-2:]
+    ]
 
-    if bearish_break and not bullish_break:
-        return {
-            "signal": "PUT",
-            "structure": "BOS",
-            "reason": "Закрытие свечи ниже подтвержденного Swing Low",
-            "score": 25
-        }
+    recent_lows = [
+        x[1] for x in swing_lows[-2:]
+    ]
 
-    # Предварительная оценка направления структуры
-    recent_highs = [x[1] for x in swing_highs[-2:]]
-    recent_lows = [x[1] for x in swing_lows[-2:]]
+    bullish_structure = False
+    bearish_structure = False
 
     if len(recent_highs) == 2 and len(recent_lows) == 2:
 
@@ -297,21 +381,45 @@ def analyze_m15(df):
             and recent_lows[-1] < recent_lows[-2]
         )
 
-        if bearish_break and bullish_structure:
-            return {
-                "signal": "PUT",
-                "structure": "CHoCH",
-                "reason": "Медвежий CHoCH: пробой против предыдущей бычьей структуры",
-                "score": 25
-            }
+    # Сначала определяем возможный CHoCH,
+    # затем BOS. Это устраняет прежнюю
+    # недостижимость проверок CHoCH.
 
-        if bullish_break and bearish_structure:
-            return {
-                "signal": "CALL",
-                "structure": "CHoCH",
-                "reason": "Бычий CHoCH: пробой против предыдущей медвежьей структуры",
-                "score": 25
-            }
+    if bullish_break and not bearish_break:
+
+        structure = (
+            "CHoCH"
+            if bearish_structure
+            else "BOS"
+        )
+
+        return {
+            "signal": "CALL",
+            "structure": structure,
+            "reason": (
+                f"Бычий {structure}: закрытие выше "
+                "подтвержденного Swing High"
+            ),
+            "score": 25
+        }
+
+    if bearish_break and not bullish_break:
+
+        structure = (
+            "CHoCH"
+            if bullish_structure
+            else "BOS"
+        )
+
+        return {
+            "signal": "PUT",
+            "structure": structure,
+            "reason": (
+                f"Медвежий {structure}: закрытие ниже "
+                "подтвержденного Swing Low"
+            ),
+            "score": 25
+        }
 
     return {
         "signal": "WAIT",
@@ -335,22 +443,24 @@ def detect_liquidity_sweep(df):
     bearish = False
 
     if swing_lows:
+
         level = swing_lows[-1][1]
 
-        bullish = (
+        bullish = bool(
             last["low"] < level
             and last["close"] > level
         )
 
     if swing_highs:
+
         level = swing_highs[-1][1]
 
-        bearish = (
+        bearish = bool(
             last["high"] > level
             and last["close"] < level
         )
 
-    return bullish, bearish
+    return bool(bullish), bool(bearish)
 
 
 # ==================================================
@@ -362,8 +472,13 @@ def detect_fvg(df):
     last = df.iloc[-1]
     third = df.iloc[-3]
 
-    bullish = last["low"] > third["high"]
-    bearish = last["high"] < third["low"]
+    bullish = bool(
+        last["low"] > third["high"]
+    )
+
+    bearish = bool(
+        last["high"] < third["low"]
+    )
 
     if bullish and not bearish:
         return "CALL"
@@ -382,18 +497,20 @@ def detect_order_block(df):
 
     last = df.iloc[-1]
 
-    # Ищем последнюю противоположную свечу
-    # перед подтвержденным движением.
-    for i in range(len(df) - 2, max(0, len(df) - 9), -1):
+    for i in range(
+        len(df) - 2,
+        max(0, len(df) - 9),
+        -1
+    ):
 
         candle = df.iloc[i]
 
-        bullish_ob = (
+        bullish_ob = bool(
             candle["close"] < candle["open"]
             and last["close"] > candle["high"]
         )
 
-        bearish_ob = (
+        bearish_ob = bool(
             candle["close"] > candle["open"]
             and last["close"] < candle["low"]
         )
@@ -416,6 +533,7 @@ def analyze_m5(df):
     sweep_call, sweep_put = detect_liquidity_sweep(df)
 
     fvg_signal = detect_fvg(df)
+
     ob_signal = detect_order_block(df)
 
     call_points = 0
@@ -440,25 +558,32 @@ def analyze_m5(df):
         put_points += 10
 
     if call_points > put_points and call_points > 0:
+
         signal = "CALL"
         score = call_points
+
     elif put_points > call_points and put_points > 0:
+
         signal = "PUT"
         score = put_points
+
     else:
+
         signal = "WAIT"
         score = 0
 
     return {
         "signal": signal,
         "reason": "Анализ Sweep, FVG и Order Block",
+
         "liquidity_sweep": {
-            "bullish": sweep_call,
-            "bearish": sweep_put
+            "bullish": bool(sweep_call),
+            "bearish": bool(sweep_put)
         },
+
         "fvg": fvg_signal,
         "order_block": ob_signal,
-        "score": score
+        "score": int(score)
     }
 
 
@@ -469,29 +594,38 @@ def analyze_m5(df):
 def analyze_m1(df):
 
     last = df.iloc[-1]
+
     recent = df.iloc[-5:-1]
 
-    bullish = (
+    bullish = bool(
         last["close"] > last["open"]
         and last["close"] > recent["high"].max()
     )
 
-    bearish = (
+    bearish = bool(
         last["close"] < last["open"]
         and last["close"] < recent["low"].min()
     )
 
     if bullish:
+
         return {
             "signal": "CALL",
-            "reason": "Бычье закрытие выше максимума предыдущих четырех свечей",
+            "reason": (
+                "Бычье закрытие выше максимума "
+                "предыдущих четырех свечей"
+            ),
             "score": 10
         }
 
     if bearish:
+
         return {
             "signal": "PUT",
-            "reason": "Медвежье закрытие ниже минимума предыдущих четырех свечей",
+            "reason": (
+                "Медвежье закрытие ниже минимума "
+                "предыдущих четырех свечей"
+            ),
             "score": 10
         }
 
@@ -555,38 +689,68 @@ def analyze_multi_timeframe(data):
         put_score += 10
 
     final_signal = "WAIT"
+
     reason = "Не выполнены обязательные условия входа"
 
-    # Обязательные условия:
-    # H1 + M15 + M5 + M1 должны совпадать.
-    if all(s == "CALL" for s in directions) and call_score >= MIN_SCORE:
-        final_signal = "CALL"
-        reason = "Все таймфреймы подтвердили бычий сетап"
+    # Все четыре таймфрейма должны совпадать.
 
-    elif all(s == "PUT" for s in directions) and put_score >= MIN_SCORE:
+    if (
+        all(s == "CALL" for s in directions)
+        and call_score >= MIN_SCORE
+    ):
+
+        final_signal = "CALL"
+
+        reason = (
+            "Все таймфреймы подтвердили бычий сетап"
+        )
+
+    elif (
+        all(s == "PUT" for s in directions)
+        and put_score >= MIN_SCORE
+    ):
+
         final_signal = "PUT"
-        reason = "Все таймфреймы подтвердили медвежий сетап"
+
+        reason = (
+            "Все таймфреймы подтвердили медвежий сетап"
+        )
 
     else:
+
         if h1["signal"] == "WAIT":
+
             reason = "Ожидание: H1 не определил направление"
+
         elif m15["signal"] == "WAIT":
+
             reason = "Ожидание: M15 не подтвердил BOS или CHoCH"
+
         elif m5["signal"] == "WAIT":
+
             reason = "Ожидание: M5 не подтвердил торговую модель"
+
         elif m1["signal"] == "WAIT":
+
             reason = "Ожидание: M1 не подтвердил точку входа"
+
         else:
-            reason = "Ожидание: направления таймфреймов противоречат друг другу"
+
+            reason = (
+                "Ожидание: направления таймфреймов "
+                "противоречат друг другу"
+            )
 
     return {
         "signal": final_signal,
         "reason": reason,
+
         "score": {
-            "CALL": call_score,
-            "PUT": put_score,
+            "CALL": int(call_score),
+            "PUT": int(put_score),
             "minimum_required": MIN_SCORE
         },
+
         "analysis": components
     }
 
@@ -599,15 +763,18 @@ def analyze_multi_timeframe(data):
 def get_signal(req: SignalRequest):
 
     pair = req.pair.strip().upper()
+
     requested_timeframe = req.timeframe.strip()
 
     if pair not in ALLOWED_PAIRS:
+
         raise HTTPException(
             status_code=400,
             detail="Эта валютная пара не поддерживается"
         )
 
     if requested_timeframe not in TIMEFRAMES:
+
         raise HTTPException(
             status_code=400,
             detail="Недопустимый таймфрейм"
@@ -616,29 +783,54 @@ def get_signal(req: SignalRequest):
     market_data = {}
 
     for tf in ANALYSIS_TIMEFRAMES:
-        market_data[tf] = get_market_data(pair, tf)
 
-    result = analyze_multi_timeframe(market_data)
+        market_data[tf] = get_market_data(
+            pair,
+            tf
+        )
+
+    result = analyze_multi_timeframe(
+        market_data
+    )
 
     last_m1 = market_data["1min"].iloc[-1]
 
-    return {
+    response = {
+
         "signal": result["signal"],
+
         "reason": result["reason"],
+
         "pair": pair,
+
         "timeframe": "1min",
+
         "requested_timeframe": requested_timeframe,
+
         "price": float(last_m1["close"]),
-        "candle_time": market_data["1min"].index[-1].isoformat(),
+
+        "candle_time": (
+            market_data["1min"].index[-1].isoformat()
+        ),
+
         "candles_used": {
-            tf: len(market_data[tf])
+            tf: int(len(market_data[tf]))
             for tf in ANALYSIS_TIMEFRAMES
         },
+
         "strategy": "SMC Multi-Timeframe",
+
         "strategy_version": VERSION,
+
         "score": result["score"],
+
         "analysis": result["analysis"]
     }
+
+    # Финальная защита от NumPy и других
+    # несовместимых с JSON типов.
+
+    return make_json_safe(response)
 
 
 # ==================================================
