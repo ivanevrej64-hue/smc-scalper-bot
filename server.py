@@ -20,7 +20,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -357,7 +357,11 @@ def analyze_m15(df):
             "structure": "NONE",
             "market_structure": "UNKNOWN",
             "reason": "Недостаточно актуальных подтвержденных Swing High / Low",
-            "score": 0
+            "score": 0,
+            "confirmed_swing_highs": int(len(recent_highs)),
+            "confirmed_swing_lows": int(len(recent_lows)),
+            "bullish_break_detected": False,
+            "bearish_break_detected": False
         }
 
     previous = df.iloc[-2]
@@ -394,7 +398,11 @@ def analyze_m15(df):
             "structure": "NONE",
             "market_structure": market_structure,
             "reason": "Не удалось рассчитать ATR для проверки пробоя",
-            "score": 0
+            "score": 0,
+            "confirmed_swing_highs": int(len(recent_highs)),
+            "confirmed_swing_lows": int(len(recent_lows)),
+            "bullish_break_detected": False,
+            "bearish_break_detected": False
         }
 
     buffer = max(atr * 0.03, abs(float(last["close"])) * 0.00001)
@@ -416,7 +424,11 @@ def analyze_m15(df):
         "swing_high_age": int(len(df) - high_index),
         "swing_low_age": int(len(df) - low_index),
         "atr": float(atr),
-        "break_buffer": float(buffer)
+        "break_buffer": float(buffer),
+        "confirmed_swing_highs": int(len(recent_highs)),
+        "confirmed_swing_lows": int(len(recent_lows)),
+        "bullish_break_detected": bool(bullish_break),
+        "bearish_break_detected": bool(bearish_break)
     }
 
     if bullish_break and not bearish_break:
@@ -732,7 +744,11 @@ def analyze_m1(df):
         return {
             "signal": "WAIT",
             "reason": "Недостаточно данных для подтверждения",
-            "score": 0
+            "score": 0,
+            "breakout_call": False,
+            "breakout_put": False,
+            "body_filter_pass": False,
+            "range_filter_pass": False
         }
 
     body = abs(float(last["close"] - last["open"]))
@@ -742,26 +758,38 @@ def analyze_m1(df):
         return {
             "signal": "WAIT",
             "reason": "Свеча не имеет диапазона",
-            "score": 0
+            "score": 0,
+            "breakout_call": False,
+            "breakout_put": False,
+            "body_filter_pass": False,
+            "range_filter_pass": False
         }
 
     body_ratio = body / candle_range
     normal_range = candle_range <= atr * 2.5
     strong_body = body >= atr * 0.2 and body_ratio >= 0.35
 
-    bullish = bool(
+    bullish_breakout = bool(
         float(last["close"]) > float(last["open"])
         and float(last["close"]) > float(recent["high"].max()) + atr * 0.03
-        and strong_body
-        and normal_range
     )
-
-    bearish = bool(
+    bearish_breakout = bool(
         float(last["close"]) < float(last["open"])
         and float(last["close"]) < float(recent["low"].min()) - atr * 0.03
-        and strong_body
-        and normal_range
     )
+
+    bullish = bool(bullish_breakout and strong_body and normal_range)
+    bearish = bool(bearish_breakout and strong_body and normal_range)
+
+    diagnostics = {
+        "breakout_call": bullish_breakout,
+        "breakout_put": bearish_breakout,
+        "body_filter_pass": bool(strong_body),
+        "range_filter_pass": bool(normal_range),
+        "candle_range_atr": round(candle_range / atr, 3),
+        "body_atr": round(body / atr, 3),
+        "body_ratio": round(body_ratio, 3)
+    }
 
     if bullish:
         return {
@@ -771,8 +799,7 @@ def analyze_m1(df):
                 "с фильтром тела и размера свечи"
             ),
             "score": 10,
-            "body_atr": round(body / atr, 3),
-            "body_ratio": round(body_ratio, 3)
+            **diagnostics
         }
 
     if bearish:
@@ -783,16 +810,14 @@ def analyze_m1(df):
                 "с фильтром тела и размера свечи"
             ),
             "score": 10,
-            "body_atr": round(body / atr, 3),
-            "body_ratio": round(body_ratio, 3)
+            **diagnostics
         }
 
     return {
         "signal": "WAIT",
         "reason": "Нет подтверждения пробоем на M1 или свеча слишком слабая",
         "score": 0,
-        "body_atr": round(body / atr, 3),
-        "body_ratio": round(body_ratio, 3)
+        **diagnostics
     }
 
 
@@ -1150,6 +1175,11 @@ def _closed_candle_slice(df, timeframe, evaluation_time, max_rows=150):
     return df.iloc[max(0, end_position - max_rows):end_position]
 
 
+def _increment_counter(counter, key):
+    key = str(key)
+    counter[key] = int(counter.get(key, 0)) + 1
+
+
 def run_historical_backtest(pair, expiry_timeframe, candle_count):
     history = {
         tf: get_market_data(pair, tf, outputsize=candle_count)
@@ -1173,18 +1203,37 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
     draws = 0
     trades = []
 
-    # Для каждого закрытия M1 свечи строим срезы только из тех
-    # старших свечей, которые к этому моменту уже закрылись.
+    timeframe_signals = {
+        tf: {"CALL": 0, "PUT": 0, "WAIT": 0}
+        for tf in ("H1", "M15", "M5", "M1")
+    }
+    m15_structures = {"BOS": 0, "CHoCH": 0, "NONE": 0}
+    m15_market_structures = {}
+    m15_swing_totals = {"highs": 0, "lows": 0, "observations": 0}
+    m15_breaks = {"bullish": 0, "bearish": 0}
+    m5_components = {
+        "sweep_bullish": 0, "sweep_bearish": 0,
+        "fvg_call": 0, "fvg_put": 0, "fvg_wait": 0,
+        "ob_call": 0, "ob_put": 0, "ob_wait": 0,
+        "conflicting_setups": 0
+    }
+    m1_filters = {
+        "breakout_call": 0, "breakout_put": 0,
+        "body_filter_pass": 0, "body_filter_fail": 0,
+        "range_filter_pass": 0, "range_filter_fail": 0
+    }
+    final_signals = {"CALL": 0, "PUT": 0, "WAIT": 0}
+    final_wait_reasons = {}
+
+    # Для каждого закрытия M1 строим срез только из свечей старших ТФ,
+    # которые уже закрылись к моменту оценки. Торговые правила не меняются.
     for i in range(len(m1)):
         m1_open_time = m1.index[i]
         evaluation_time = m1_open_time + TIMEFRAMES["1min"]
 
         window = {
             tf: _closed_candle_slice(
-                history[tf],
-                tf,
-                evaluation_time,
-                max_rows=CANDLE_LIMIT
+                history[tf], tf, evaluation_time, max_rows=CANDLE_LIMIT
             )
             for tf in ANALYSIS_TIMEFRAMES
         }
@@ -1195,17 +1244,62 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
 
         evaluated += 1
         result = analyze_multi_timeframe(window)
+        analysis = result["analysis"]
 
-        if result["signal"] not in ("CALL", "PUT"):
+        # Частота направлений каждого отдельного фильтра.
+        for label in ("H1", "M15", "M5", "M1"):
+            _increment_counter(timeframe_signals[label], analysis[label]["signal"])
+
+        # Диагностика M15: тип структуры, состояние рынка, доступность swing.
+        m15 = analysis["M15"]
+        _increment_counter(m15_structures, m15.get("structure", "NONE"))
+        _increment_counter(m15_market_structures, m15.get("market_structure", "UNKNOWN"))
+        m15_swing_totals["highs"] += int(m15.get("confirmed_swing_highs", 0))
+        m15_swing_totals["lows"] += int(m15.get("confirmed_swing_lows", 0))
+        m15_swing_totals["observations"] += 1
+        if m15.get("bullish_break_detected"):
+            m15_breaks["bullish"] += 1
+        if m15.get("bearish_break_detected"):
+            m15_breaks["bearish"] += 1
+
+        # Диагностика отдельных моделей M5, включая конфликты направлений.
+        m5 = analysis["M5"]
+        sweep = m5.get("liquidity_sweep", {})
+        if sweep.get("bullish"):
+            m5_components["sweep_bullish"] += 1
+        if sweep.get("bearish"):
+            m5_components["sweep_bearish"] += 1
+        fvg = m5.get("fvg", "WAIT")
+        ob = m5.get("order_block", "WAIT")
+        _increment_counter(m5_components, f"fvg_{str(fvg).lower()}")
+        _increment_counter(m5_components, f"ob_{str(ob).lower()}")
+        details = m5.get("details", {})
+        if details.get("call_points_total", 0) > 0 and details.get("put_points_total", 0) > 0:
+            m5_components["conflicting_setups"] += 1
+
+        # Диагностика M1: отдельно пробой, тело и размер свечи.
+        m1_analysis = analysis["M1"]
+        for field in ("breakout_call", "breakout_put", "body_filter_pass", "range_filter_pass"):
+            if m1_analysis.get(field):
+                m1_filters[field] += 1
+        if "body_filter_pass" in m1_analysis:
+            fail_key = "body_filter_fail" if not m1_analysis["body_filter_pass"] else None
+            if fail_key:
+                m1_filters[fail_key] += 1
+        if "range_filter_pass" in m1_analysis:
+            fail_key = "range_filter_fail" if not m1_analysis["range_filter_pass"] else None
+            if fail_key:
+                m1_filters[fail_key] += 1
+
+        _increment_counter(final_signals, result["signal"])
+        if result["signal"] == "WAIT":
+            _increment_counter(final_wait_reasons, result["reason"])
             continue
 
         signals += 1
-
         entry_price = float(m1.iloc[i]["close"])
-        # Вход моделируется после закрытия сигнальной M1 свечи.
         entry_time = m1_open_time + TIMEFRAMES["1min"]
         expiry_at = entry_time + expiry_duration
-
         future = m1[m1.index >= expiry_at]
 
         if future.empty:
@@ -1249,20 +1343,14 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
             })
 
     closed_trades = wins + losses + draws
-    win_rate = (
-        round(wins / closed_trades * 100, 2)
-        if closed_trades else None
-    )
+    win_rate = round(wins / closed_trades * 100, 2) if closed_trades else None
 
     return {
         "strategy_version": VERSION,
         "pair": pair,
         "expiry_timeframe": expiry_timeframe,
         "requested_m1_candles": candle_count,
-        "available_candles": {
-            tf: int(len(history[tf]))
-            for tf in ANALYSIS_TIMEFRAMES
-        },
+        "available_candles": {tf: int(len(history[tf])) for tf in ANALYSIS_TIMEFRAMES},
         "evaluated_points": evaluated,
         "skipped_points_insufficient_history": skipped,
         "signals_generated": signals,
@@ -1273,11 +1361,28 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
         "win_rate_percent": win_rate,
         "trades_returned": len(trades),
         "trades": trades,
+        "diagnostics": {
+            "timeframe_signal_counts": timeframe_signals,
+            "m15": {
+                "structure_counts": m15_structures,
+                "market_structure_counts": m15_market_structures,
+                "average_confirmed_swings_per_evaluation": {
+                    "highs": round(m15_swing_totals["highs"] / m15_swing_totals["observations"], 2) if evaluated else 0,
+                    "lows": round(m15_swing_totals["lows"] / m15_swing_totals["observations"], 2) if evaluated else 0
+                },
+                "break_detections": m15_breaks
+            },
+            "m5": m5_components,
+            "m1": m1_filters,
+            "final_signal_counts": final_signals,
+            "final_wait_reasons": final_wait_reasons
+        },
         "limitations": [
             "Backtest использует доступную историю Twelve Data и текущие правила стратегии.",
             "Комиссии, спред, проскальзывание и выплаты брокера не учитываются.",
             "Результат не гарантирует будущую доходность.",
-            "Если сделок больше 200, в ответе показаны только первые 200; итоговая статистика учитывает все закрытые сделки."
+            "Если сделок больше 200, в ответе показаны только первые 200; итоговая статистика учитывает все закрытые сделки.",
+            "Диагностика показывает частоту условий фильтров, но сама по себе не доказывает прибыльность стратегии."
         ]
     }
 
