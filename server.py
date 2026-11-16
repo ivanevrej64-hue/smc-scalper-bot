@@ -21,7 +21,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.8"
+VERSION = "2.4.9"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -2665,6 +2665,369 @@ def _combine_robustness_reports(reports):
     }
 
 
+# ==================================================
+# PRICE/TIME AUDIT: NO TRADING LOGIC CHANGES
+# ==================================================
+
+def _pip_summary(values):
+    """Distribution of REAL adjacent M1 opening/closing gaps in pips."""
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return {
+            "observations": 0, "mean_pips": None, "median_pips": None,
+            "mean_absolute_pips": None, "median_absolute_pips": None,
+            "p90_absolute_pips": None, "p99_absolute_pips": None,
+            "maximum_absolute_pips": None, "positive": 0, "negative": 0,
+            "zero": 0, "absolute_at_least_half_pip": 0,
+            "absolute_at_least_one_pip": 0,
+        }
+    abs_vals = np.abs(arr)
+    epsilon = 1e-8
+    return {
+        "observations": int(arr.size),
+        "mean_pips": round(float(np.mean(arr)), 5),
+        "median_pips": round(float(np.median(arr)), 5),
+        "mean_absolute_pips": round(float(np.mean(abs_vals)), 5),
+        "median_absolute_pips": round(float(np.median(abs_vals)), 5),
+        "p90_absolute_pips": round(float(np.percentile(abs_vals, 90)), 5),
+        "p99_absolute_pips": round(float(np.percentile(abs_vals, 99)), 5),
+        "maximum_absolute_pips": round(float(np.max(abs_vals)), 5),
+        "positive": int(np.sum(arr > epsilon)),
+        "negative": int(np.sum(arr < -epsilon)),
+        "zero": int(np.sum(np.abs(arr) <= epsilon)),
+        "absolute_at_least_half_pip": int(np.sum(abs_vals + epsilon >= 0.5)),
+        "absolute_at_least_one_pip": int(np.sum(abs_vals + epsilon >= 1.0)),
+    }
+
+
+def _audit_execution_price_gaps(events, m1, pair, expiry_timeframe):
+    """Compare signal-close to next-M1-open, keeping SAME exit timestamp.
+
+    This does NOT simulate tick-level fills and does NOT alter outcomes used
+    anywhere else in the bot. It is deliberately a diagnostic-only function.
+    """
+    if expiry_timeframe not in ("1min", "5min"):
+        raise ValueError("Unsupported audit expiry")
+    if not m1.index.is_unique or not m1.index.is_monotonic_increasing:
+        raise HTTPException(
+            status_code=422,
+            detail="PRICE_AUDIT_REQUIRES_SORTED_UNIQUE_M1_CANDLES",
+        )
+    pip = _pip_size_for_pair(pair)
+    step = pd.Timedelta(minutes=1)
+    tolerance = max(pip * 1e-5, 1e-12)
+    close = m1["close"].to_numpy(dtype=float)
+    opening = m1["open"].to_numpy(dtype=float)
+    ns = m1.index.asi8
+    deltas = ns[1:] - ns[:-1]
+    valid = deltas == int(step.value)
+    # Only CONSECUTIVE fully closed M1 candles, never crossing weekends/gaps.
+    adjacent_gaps = ((opening[1:] - close[:-1]) / pip)[valid].tolist()
+    rows = []
+    all_gaps = []
+    adverse_gaps = []
+    consistency = {
+        "signals_seen": int(len(events)),
+        "verified_signal_closes": 0,
+        "reference_close_mismatches": 0,
+        "missing_signal_candle": 0,
+        "missing_next_open_candle": 0,
+        "missing_expiry_candle": 0,
+        "non_finite_price": 0,
+        "nonpositive_prices": 0,
+        "invalid_time_order": 0,
+    }
+    matrix = {
+        "WIN": {"WIN": 0, "LOSS": 0, "DRAW": 0},
+        "LOSS": {"WIN": 0, "LOSS": 0, "DRAW": 0},
+        "DRAW": {"WIN": 0, "LOSS": 0, "DRAW": 0},
+    }
+    for event in sorted(events, key=lambda v: pd.Timestamp(v["entry_time"])):
+        side = event["signal"]
+        if side not in ("CALL", "PUT"):
+            raise ValueError("Expected CALL/PUT signal event")
+        signal_time = pd.Timestamp(event["entry_time"])
+        if signal_time.tzinfo is None:
+            raise ValueError("Historical signal timestamp is naive")
+        candle_open = signal_time - step
+        if candle_open not in m1.index:
+            consistency["missing_signal_candle"] += 1
+            continue
+        if signal_time not in m1.index:
+            consistency["missing_next_open_candle"] += 1
+            continue
+        source_close = float(m1.at[candle_open, "close"])
+        event_close = float(event["entry_price"])
+        next_open = float(m1.at[signal_time, "open"])
+        if not all(math.isfinite(v) for v in (source_close, event_close, next_open)):
+            consistency["non_finite_price"] += 1
+            continue
+        if min(source_close, event_close, next_open) <= 0:
+            consistency["nonpositive_prices"] += 1
+            continue
+        if abs(source_close - event_close) > tolerance:
+            consistency["reference_close_mismatches"] += 1
+            # A mismatch is a test-integrity failure, not a trade to use.
+            continue
+        consistency["verified_signal_closes"] += 1
+        expiry_at = signal_time + TIMEFRAMES[expiry_timeframe]
+        if not candle_open < signal_time < expiry_at:
+            consistency["invalid_time_order"] += 1
+            continue
+        exit_info = _m1_candle_at_expiry(m1, expiry_at)
+        if exit_info is None:
+            consistency["missing_expiry_candle"] += 1
+            continue
+        exit_price = float(exit_info["exit_price"])
+        if not math.isfinite(exit_price) or exit_price <= 0:
+            consistency["non_finite_price"] += 1
+            continue
+        gap = (next_open - source_close) / pip
+        # POSITIVE is adverse to CALL when open rises, adverse to PUT when open falls.
+        adverse = gap if side == "CALL" else -gap
+        old_outcome = _expiry_outcome(side, event_close, exit_price)
+        next_outcome = _expiry_outcome(side, next_open, exit_price)
+        matrix[old_outcome][next_outcome] += 1
+        all_gaps.append(float(gap))
+        adverse_gaps.append(float(adverse))
+        rows.append({
+            "side": side,
+            "signal_candle_open_utc": candle_open.isoformat(),
+            "signal_available_at_utc": signal_time.isoformat(),
+            "next_m1_open_utc": signal_time.isoformat(),
+            "expiry_utc": expiry_at.isoformat(),
+            "exit_candle_open_utc": exit_info["exit_candle_open_time"],
+            "signal_candle_close": round(source_close, 7),
+            "next_candle_open": round(next_open, 7),
+            "expiry_close": round(exit_price, 7),
+            "raw_gap_pips": round(float(gap), 5),
+            "adverse_directional_gap_pips": round(float(adverse), 5),
+            "close_entry_outcome": old_outcome,
+            "next_open_outcome": next_outcome,
+            "outcome_changed": old_outcome != next_outcome,
+        })
+    positive_adverse = sum(a > 1e-8 for a in adverse_gaps)
+    favorable = sum(a < -1e-8 for a in adverse_gaps)
+    neutral = len(adverse_gaps) - positive_adverse - favorable
+    changes = sum(r["outcome_changed"] for r in rows)
+    alerts = []
+    if any(consistency[k] for k in (
+        "reference_close_mismatches", "missing_signal_candle",
+        "missing_next_open_candle", "invalid_time_order", "non_finite_price",
+        "nonpositive_prices",
+    )):
+        alerts.append("EVENT_PRICE_OR_TIME_MISMATCH")
+    if len(adverse_gaps) >= 8 and float(np.mean(adverse_gaps)) <= -0.25:
+        alerts.append("SYSTEMATIC_FAVORABLE_NEXT_OPEN_FOR_SIGNAL_DIRECTION")
+    if len(adverse_gaps) >= 8 and favorable / len(adverse_gaps) >= 0.80:
+        alerts.append("UNUSUAL_FAVORABLE_GAP_FRACTION_AT_SIGNALS")
+    if len(adjacent_gaps) >= 100 and float(np.mean(np.abs(adjacent_gaps))) >= 0.30:
+        alerts.append("MATERIAL_GAPS_COMMON_IN_UNFILTERED_M1_DATA")
+    if len(all_gaps) >= 8 and float(np.mean(np.abs(all_gaps))) >= 0.50:
+        alerts.append("MATERIAL_GAPS_AT_SIGNAL_TIMES")
+    if len(rows) < len(events):
+        alerts.append("UNRESOLVED_OR_UNVERIFIED_AUDIT_EVENTS")
+    # Keep output short enough to paste into chat; make samples deterministic.
+    selected = set(range(min(4, len(rows))))
+    selected.update(sorted(range(len(rows)), key=lambda i: abs(rows[i]["raw_gap_pips"]),
+                           reverse=True)[:5])
+    selected.update(i for i, row in enumerate(rows) if row["outcome_changed"])
+    samples = [rows[i] for i in sorted(selected)[:25]]
+    return {
+        "status": "REVIEW_REQUIRED" if alerts else "CHECKED",
+        "warnings": alerts,
+        "price_basis": "Twelve Data M1 candle close/open, not broker bid/ask or tick fills",
+        "pip_size": pip,
+        "signal_close_to_next_open": _pip_summary(all_gaps),
+        "adverse_gap_by_trade_direction": {
+            **_pip_summary(adverse_gaps),
+            "favorable": favorable,
+            "adverse": positive_adverse,
+            "neutral": neutral,
+            "by_direction": {
+                side: {
+                    **_pip_summary([r["raw_gap_pips"] for r in rows if r["side"] == side]),
+                    "favorable": sum(r["adverse_directional_gap_pips"] < -1e-8 for r in rows if r["side"] == side),
+                    "adverse": sum(r["adverse_directional_gap_pips"] > 1e-8 for r in rows if r["side"] == side),
+                }
+                for side in ("CALL", "PUT")
+            },
+        },
+        "all_adjacent_m1_close_to_next_open_gaps": _pip_summary(adjacent_gaps),
+        "outcome_effect_same_expiry": {
+            "compared_settled_trades": len(rows),
+            "outcome_changed_count": changes,
+            "outcome_transition_matrix": matrix,
+            "close_entry": {
+                k: sum(row["close_entry_outcome"] == k for row in rows)
+                for k in ("WIN", "LOSS", "DRAW")
+            },
+            "next_open_entry": {
+                k: sum(row["next_open_outcome"] == k for row in rows)
+                for k in ("WIN", "LOSS", "DRAW")
+            },
+            "expiry_time_changed": False,
+        },
+        "data_consistency": consistency,
+        "sample_trades": samples,
+        "_private_all_gaps": all_gaps,
+        "_private_adverse_gaps": adverse_gaps,
+        "_private_adjacent_gaps": adjacent_gaps,
+        "_private_rows": rows,
+    }
+
+
+@app.post("/api/backtest/execution-audit")
+def backtest_execution_price_audit(req: BacktestRobustnessRequest):
+    """Investigate suspicious close-to-open gaps without modifying /api/signal.
+
+    Uses the same independent weekly windows and historic signal generation as
+    /api/backtest/robustness; returns detailed audit instead of large P&L data.
+    """
+    pair = req.pair.strip().upper()
+    if pair not in ALLOWED_PAIRS:
+        raise HTTPException(status_code=400, detail="Эта валютная пара не поддерживается")
+    timeframe = req.expiry_timeframe.strip()
+    if timeframe not in ("1min", "5min"):
+        raise HTTPException(status_code=400, detail="expiry_timeframe должен быть 1min или 5min")
+    weekly = []
+    failures = []
+    agg_raw = []
+    agg_adverse = []
+    agg_adjacent = []
+    aggregate_consistency = {}
+    outcome_matrix = {
+        k: {kk: 0 for kk in ("WIN", "LOSS", "DRAW")}
+        for k in ("WIN", "LOSS", "DRAW")
+    }
+    combined_rows = []
+    total_events = 0
+    total_independent = 0
+    aggregate_warnings = set()
+
+    for week_end in _last_completed_friday_anchors(req.weeks):
+        try:
+            raw = {
+                tf: get_market_data(
+                    pair, tf, outputsize=req.candles_per_week,
+                    end_date=week_end.tz_convert("UTC"),
+                )
+                for tf in ANALYSIS_TIMEFRAMES
+            }
+            base = run_historical_backtest(
+                pair=pair, expiry_timeframe=timeframe,
+                candle_count=req.candles_per_week,
+                market_mode="regular_forex", history_override=raw,
+                collect_signal_events=True,
+            )
+            events = base.pop("_signal_events_for_comparison")
+            m1 = _regular_forex_filter(raw["1min"], "1min")
+            report = _audit_execution_price_gaps(events, m1, pair, timeframe)
+            # Compare close-entry audit to the existing legacy backtest. If
+            # different, surface the discrepancy rather than silently claiming P&L.
+            legacy_counts = {"WIN": base["wins"], "LOSS": base["losses"], "DRAW": base["draws"]}
+            if report["outcome_effect_same_expiry"]["close_entry"] != legacy_counts:
+                report["warnings"].append("AUDIT_DISAGREES_WITH_LEGACY_BACKTEST")
+                report["status"] = "REVIEW_REQUIRED"
+            for k, val in report["data_consistency"].items():
+                aggregate_consistency[k] = aggregate_consistency.get(k, 0) + val
+            for old_side, transitions in report["outcome_effect_same_expiry"]["outcome_transition_matrix"].items():
+                for new_side, count in transitions.items():
+                    outcome_matrix[old_side][new_side] += count
+            agg_raw.extend(report.pop("_private_all_gaps"))
+            agg_adverse.extend(report.pop("_private_adverse_gaps"))
+            agg_adjacent.extend(report.pop("_private_adjacent_gaps"))
+            combined_rows.extend(report.pop("_private_rows"))
+            aggregate_warnings.update(report["warnings"])
+            independent = _select_cooldown_events(events, req.cooldown_minutes)
+            total_events += len(events)
+            total_independent += len(independent)
+            weekly.append({
+                "week_end_new_york": week_end.isoformat(),
+                "evaluated_points": base["evaluated_points"],
+                "signals_generated": len(events),
+                "independent_signals_after_cooldown": len(independent),
+                "data_audit": {
+                    "status": base["backtest_data_audit"]["status"],
+                    "future_candle_violations": base["backtest_data_audit"]["future_candle_violations"],
+                    "m1_window_alignment_violations": base["backtest_data_audit"]["m1_window_alignment_violations"],
+                },
+                "execution_price_audit": report,
+            })
+        except HTTPException as exc:
+            if isinstance(exc.detail, dict) and exc.detail.get("error") == "BACKTEST_LOOKAHEAD_BLOCKED":
+                raise
+            failures.append({"week_end_new_york": week_end.isoformat(),
+                             "status_code": exc.status_code,
+                             "error": make_json_safe(exc.detail)})
+
+    if not weekly:
+        raise HTTPException(status_code=502, detail={"error": "NO_VALID_WEEKS",
+                                                      "failures": failures})
+    total_wins_close = {
+        k: sum(outcome_matrix[k].values()) for k in ("WIN", "LOSS", "DRAW")
+    }
+    total_wins_open = {
+        k: sum(outcome_matrix[j][k] for j in ("WIN", "LOSS", "DRAW"))
+        for k in ("WIN", "LOSS", "DRAW")
+    }
+    gap_warnings = []
+    if len(agg_adverse) >= 8 and np.mean(agg_adverse) <= -0.25:
+        gap_warnings.append("SYSTEMATIC_FAVORABLE_NEXT_OPEN_FOR_SIGNAL_DIRECTION")
+    if len(agg_adjacent) >= 100 and np.mean(np.abs(agg_adjacent)) >= 0.30:
+        gap_warnings.append("MATERIAL_GAPS_COMMON_IN_UNFILTERED_M1_DATA")
+    if len(agg_raw) >= 8 and np.mean(np.abs(agg_raw)) >= 0.50:
+        gap_warnings.append("MATERIAL_GAPS_AT_SIGNAL_TIMES")
+    aggregate_warnings.update(gap_warnings)
+    return make_json_safe({
+        "strategy_version": VERSION,
+        "pair": pair,
+        "expiry_timeframe": timeframe,
+        "market_mode": "regular_forex",
+        "requested_weeks": req.weeks,
+        "completed_weeks": len(weekly),
+        "partial": bool(failures),
+        "candles_per_week_requested": req.candles_per_week,
+        "cooldown_minutes": req.cooldown_minutes,
+        "status": "REVIEW_REQUIRED" if aggregate_warnings else "CHECKED",
+        "warnings": sorted(aggregate_warnings),
+        "overall": {
+            "signal_events": total_events,
+            "cooldown_selected_events": total_independent,
+            "signal_close_to_next_open": _pip_summary(agg_raw),
+            "adverse_gap_by_trade_direction": {
+                **_pip_summary(agg_adverse),
+                "favorable": int(sum(v < -1e-8 for v in agg_adverse)),
+                "adverse": int(sum(v > 1e-8 for v in agg_adverse)),
+                "neutral": int(sum(abs(v) <= 1e-8 for v in agg_adverse)),
+            },
+            "baseline_all_adjacent_m1_gaps": _pip_summary(agg_adjacent),
+            "data_consistency": aggregate_consistency,
+            "outcome_effect_same_expiry": {
+                "close_entry": total_wins_close,
+                "next_open_entry": total_wins_open,
+                "changed_outcomes": sum(
+                    outcome_matrix[old][new] for old in outcome_matrix
+                    for new in outcome_matrix[old] if old != new
+                ),
+                "matrix": outcome_matrix,
+                "expiry_time_changed": False,
+            },
+        },
+        "weeks": weekly,
+        "failures": failures,
+        "limitations": [
+            "Обнаружение необычных разрывов — сигнал о проверке качества данных, а не доказательство ошибки поставщика.",
+            "Котировки Twelve Data M1 не воспроизводят bid/ask и точку исполнения брокера.",
+            "Цена после секундной задержки неизвестна по минутным свечам.",
+            "Для close-entry и next-open-entry используется ОДНА И ТА ЖЕ свеча экспирации.",
+            "Систематически выгодный next-open может быть следствием смещения котировок или правил формирования свечей.",
+            "Исторические сигналы близки по времени и не являются независимыми наблюдениями.",
+            "Ни один показатель аудита не изменяет торговые фильтры или реальные /api/signal ответы.",
+        ],
+    })
+
+
 @app.post("/api/backtest/robustness")
 def backtest_execution_robustness(req: BacktestRobustnessRequest):
     """Separate historical weeks, entry sensitivity and cooldown selection.
@@ -2877,6 +3240,7 @@ def api_health():
         "regular_forex_sessions": True,
         "weekly_expiry_comparison": True,
         "execution_robustness_backtest": True,
+        "execution_price_audit": True,
     }
 
 
