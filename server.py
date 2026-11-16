@@ -20,7 +20,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.4"
+VERSION = "2.4.5"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -1759,6 +1759,19 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
     final_signals = {"CALL": 0, "PUT": 0, "WAIT": 0}
     final_wait_reasons = {}
 
+    # Audit only: chronological integrity and representative market snapshots.
+    # This does not change signal scoring, filters, or trade settlement.
+    audit_last_candle_times = {tf: set() for tf in ANALYSIS_TIMEFRAMES}
+    audit_signal_signatures = set()
+    audit_m1_close_values = set()
+    audit_samples = []
+    audit_temporal_violations = 0
+    audit_m1_window_mismatch = 0
+    audit_first_signature = None
+    audit_signature_changes = 0
+    audit_sample_indices = {0, len(m1) // 4, len(m1) // 2,
+                            (3 * len(m1)) // 4, len(m1) - 1}
+
     # Для каждого закрытия M1 строим срез только из свечей старших ТФ,
     # которые уже закрылись к моменту оценки. Торговые правила не меняются.
     for i in range(len(m1)):
@@ -1779,6 +1792,48 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
         evaluated += 1
         result = analyze_multi_timeframe(window, include_m5_diagnostics=False)
         analysis = result["analysis"]
+
+        for tf in ANALYSIS_TIMEFRAMES:
+            last_open = window[tf].index[-1]
+            audit_last_candle_times[tf].add(last_open.isoformat())
+            if last_open + TIMEFRAMES[tf] > evaluation_time:
+                audit_temporal_violations += 1
+        if window["1min"].index[-1] != m1_open_time:
+            audit_m1_window_mismatch += 1
+        audit_m1_close_values.add(float(window["1min"].iloc[-1]["close"]))
+
+        signature = (
+            analysis["H1"]["signal"], analysis["M15"]["signal"],
+            analysis["M15"].get("structure"),
+            analysis["M15"].get("event_age_bars"),
+            analysis["M5"]["signal"], analysis["M5"].get("fvg"),
+            analysis["M5"].get("order_block"),
+            analysis["M1"]["signal"],
+            analysis["M1"].get("breakout_call"),
+            analysis["M1"].get("breakout_put"),
+        )
+        audit_signal_signatures.add(signature)
+        if audit_first_signature is None:
+            audit_first_signature = signature
+        elif signature != audit_first_signature:
+            audit_signature_changes += 1
+
+        if i in audit_sample_indices or evaluated == 1:
+            audit_samples.append({
+                "evaluation_time": evaluation_time.isoformat(),
+                "m1_open_time": m1_open_time.isoformat(),
+                "last_closed_candle_open_times": {
+                    tf: window[tf].index[-1].isoformat()
+                    for tf in ANALYSIS_TIMEFRAMES
+                },
+                "last_closed_candle_prices": {
+                    tf: float(window[tf].iloc[-1]["close"])
+                    for tf in ANALYSIS_TIMEFRAMES
+                },
+                "m15_memory_age": analysis["M15"].get("event_age_bars"),
+                "alignment": result["alignment"],
+                "final_signal": result["signal"],
+            })
 
         # Частота направлений каждого отдельного фильтра.
         for label in ("H1", "M15", "M5", "M1"):
@@ -1932,6 +1987,43 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
     closed_trades = wins + losses + draws
     win_rate = round(wins / closed_trades * 100, 2) if closed_trades else None
 
+    audit_warnings = []
+    if audit_temporal_violations:
+        audit_warnings.append("FUTURE_CANDLES_IN_HISTORICAL_SLICES")
+    if audit_m1_window_mismatch:
+        audit_warnings.append("M1_WINDOW_NOT_ALIGNED_WITH_EVALUATION")
+    if evaluated >= 100:
+        for tf in ("1min", "5min", "15min", "1h"):
+            if len(audit_last_candle_times[tf]) <= 1:
+                audit_warnings.append(f"FROZEN_LAST_CLOSED_CANDLE_{tf}")
+        if len(audit_signal_signatures) == 1:
+            audit_warnings.append("IDENTICAL_SIGNAL_DIAGNOSTICS_AT_ALL_TIMES")
+        if len(audit_m1_close_values) == 1:
+            audit_warnings.append("IDENTICAL_M1_CLOSE_AT_ALL_TIMES")
+    audit = {
+        "status": "SUSPICIOUS" if audit_warnings else "CHECKED",
+        "warnings": audit_warnings,
+        "time_basis": "UTC; Twelve Data candles indexed by opening time",
+        "history_ranges": {
+            tf: {
+                "rows": int(len(history[tf])),
+                "first_candle_open": history[tf].index[0].isoformat(),
+                "last_candle_open": history[tf].index[-1].isoformat(),
+            }
+            for tf in ANALYSIS_TIMEFRAMES
+        },
+        "unique_last_closed_candle_times": {
+            tf: len(audit_last_candle_times[tf])
+            for tf in ANALYSIS_TIMEFRAMES
+        },
+        "unique_m1_close_values": len(audit_m1_close_values),
+        "unique_signal_diagnostic_signatures": len(audit_signal_signatures),
+        "observations_differing_from_first_signature": audit_signature_changes,
+        "future_candle_violations": audit_temporal_violations,
+        "m1_window_alignment_violations": audit_m1_window_mismatch,
+        "sample_evaluations": audit_samples,
+    }
+
     return {
         "strategy_version": VERSION,
         "pair": pair,
@@ -1951,6 +2043,7 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
         "win_rate_percent": win_rate,
         "trades_returned": len(trades),
         "trades": trades,
+        "backtest_data_audit": audit,
         "diagnostics": {
             "timeframe_signal_counts": timeframe_signals,
             "m15": {
@@ -1993,7 +2086,8 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
             "Диагностика показывает частоту условий фильтров, но сама по себе не доказывает прибыльность стратегии.",
             "Экспирация измеряется по закрытию M1 свечи ровно в момент expiry_at; если такой свечи нет, исход остаётся неопределённым.",
             "Статистика воронки — по проверкам M1, а не независимым торговым возможностям; соседние проверки статистически зависимы.",
-            "WIN/LOSS не учитывает цену входа/выхода на брокере и скорость исполнения."
+            "WIN/LOSS не учитывает цену входа/выхода на брокере и скорость исполнения.",
+            "backtest_data_audit проверяет временную целостность и разнообразие результатов; предупреждения требуют проверки входных свечей."
         ]
     }
 
