@@ -1,0 +1,30 @@
+name: SMC Forward Paper Scan (DEMO only)
+
+on:
+  # Pilot: every 10 minutes on weekdays, 07:00–18:59 UTC.
+  # GitHub schedule is approximate, and may be delayed or skipped.
+  schedule:
+    - cron: '7,17,27,37,47,57 7-18 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smc-forward-paper-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    # Disabled until you set the repo variable PAPER_SCANNER_ENABLED=true.
+    # Manual 'Run workflow' always works for setup testing.
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.PAPER_SCANNER_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch code
+        uses: actions/checkout@v4
+      - name: Execute authenticated scan
+        env:
+          PAPER_API_KEY: ${{ secrets.PAPER_API_KEY }}
+        run: python3 scripts/paper_auto_scan.py
