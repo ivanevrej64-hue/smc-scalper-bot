@@ -21,7 +21,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.10"
+VERSION = "2.4.11"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -3257,6 +3257,284 @@ def backtest_execution_robustness(req: BacktestRobustnessRequest):
 
 
 # ==================================================
+# CONSERVATIVE EXECUTION AUDIT - NO FAVORABLE GAPS ASSUMED
+# ==================================================
+
+def _conservative_fill_test(events, m1, pair, expiry_timeframe):
+    """Pessimistic historical settlement without using favorable close/open gaps.
+
+    This is a sensitivity test, NOT a claim to reproduce actual broker fills.
+    Signal is available at T after the preceding M1 candle closes.
+    Settlement is M1 closing at T + expiry_timeframe.
+    When a later M1 OPEN would have improved the entry, the pessimistic
+    scenario uses the less favorable *reference close* instead. When OPEN
+    is worse, it uses OPEN. Additional 0.2/0.5 pip moves are adverse.
+    """
+    if expiry_timeframe not in ('1min', '5min'):
+        raise ValueError('Only 1min and 5min expiries supported')
+    pip = _pip_size_for_pair(pair)
+    one_minute = pd.Timedelta(minutes=1)
+    names = ('reference_close', 'observed_next_open', 'no_favorable_gap',
+             'no_favorable_gap_plus_0_2pip', 'no_favorable_gap_plus_0_5pip')
+    counters = {
+        name: {'signals_generated': len(events), 'closed_trades': 0,
+               'wins': 0, 'losses': 0, 'draws': 0,
+               'unresolved_price_or_time': 0,
+               'unresolved_expiry_candles': 0}
+        for name in names
+    }
+    favorable_gap_events = 0
+    adverse_gap_events = 0
+    neutral_gap_events = 0
+    total_pips_favorable_removed = 0.0
+    observations = 0
+    example_rows = []
+    for event in sorted(events, key=lambda x: pd.Timestamp(x['entry_time'])):
+        side = event['signal']
+        if side not in ('CALL', 'PUT'):
+            raise ValueError('Expected CALL/PUT event')
+        t = pd.Timestamp(event['entry_time'])
+        if t.tzinfo is None:
+            raise ValueError('Naive event timestamp')
+        preceding_open = t - one_minute
+        if preceding_open not in m1.index or t not in m1.index:
+            for counter in counters.values():
+                counter['unresolved_price_or_time'] += 1
+            continue
+        source_close = float(m1.at[preceding_open, 'close'])
+        reference_close = float(event['entry_price'])
+        next_open = float(m1.at[t, 'open'])
+        if (not all(math.isfinite(x) and x > 0 for x in
+                    (source_close, reference_close, next_open))):
+            for counter in counters.values():
+                counter['unresolved_price_or_time'] += 1
+            continue
+        if abs(source_close - reference_close) > max(1e-8, pip / 1000.0):
+            # Never silently price an event against a different source candle.
+            raise ValueError('Signal event entry_price does not match preceding closed candle')
+        expiry_at = t + TIMEFRAMES[expiry_timeframe]
+        exit_info = _m1_candle_at_expiry(m1, expiry_at)
+        if exit_info is None:
+            for counter in counters.values():
+                counter['unresolved_expiry_candles'] += 1
+            continue
+        exit_price = float(exit_info['exit_price'])
+        if not math.isfinite(exit_price) or exit_price <= 0:
+            for counter in counters.values():
+                counter['unresolved_expiry_candles'] += 1
+            continue
+        # Lower entry is favorable for CALL, higher entry favorable for PUT.
+        guarded = max(source_close, next_open) if side == 'CALL' else min(source_close, next_open)
+        favorable_in_pips = ((source_close - next_open) / pip
+                             if side == 'CALL' else (next_open - source_close) / pip)
+        if favorable_in_pips > 1e-8:
+            favorable_gap_events += 1
+            total_pips_favorable_removed += favorable_in_pips
+        elif favorable_in_pips < -1e-8:
+            adverse_gap_events += 1
+        else:
+            neutral_gap_events += 1
+        observations += 1
+        adverse_sign = 1 if side == 'CALL' else -1
+        prices = {
+            'reference_close': source_close,
+            'observed_next_open': next_open,
+            'no_favorable_gap': guarded,
+            'no_favorable_gap_plus_0_2pip': guarded + adverse_sign * 0.2 * pip,
+            'no_favorable_gap_plus_0_5pip': guarded + adverse_sign * 0.5 * pip,
+        }
+        outcomes = {}
+        for name, entry_price in prices.items():
+            outcome = _expiry_outcome(side, entry_price, exit_price)
+            outcomes[name] = outcome
+            counts = counters[name]
+            counts['closed_trades'] += 1
+            counts[{'WIN': 'wins', 'LOSS': 'losses', 'DRAW': 'draws'}[outcome]] += 1
+        # Detailed examples are diagnostic only, never used for computing rates.
+        if len(example_rows) < 8 and (favorable_in_pips > 1e-8 or
+                                     outcomes['observed_next_open'] != outcomes['no_favorable_gap']):
+            example_rows.append({
+                'direction': side, 'entry_time_utc': t.isoformat(),
+                'expiry_at_utc': expiry_at.isoformat(),
+                'signal_close': round(source_close, 7),
+                'observed_next_open': round(next_open, 7),
+                'conservative_entry': round(guarded, 7),
+                'exit_close': round(exit_price, 7),
+                'favorable_gap_pips': round(max(0.0, favorable_in_pips), 4),
+                'observed_outcome': outcomes['observed_next_open'],
+                'conservative_outcome': outcomes['no_favorable_gap'],
+            })
+    totals = {}
+    for name, counts in counters.items():
+        wins, losses, draws = (counts[k] for k in ('wins', 'losses', 'draws'))
+        total = counts['closed_trades']
+        totals[name] = {
+            **counts,
+            'win_rate_percent': round(100 * wins / total, 2) if total else None,
+            'payout_analysis': _payout_analysis(wins, losses, draws),
+        }
+    return {
+        'scenario_results': totals,
+        'gap_dependency': {
+            'verified_events': observations,
+            'favorable_gap_events': favorable_gap_events,
+            'adverse_gap_events': adverse_gap_events,
+            'neutral_gap_events': neutral_gap_events,
+            'total_favorable_pips_removed': round(total_pips_favorable_removed, 4),
+            'avg_favorable_pips_removed_per_verified_signal': (
+                round(total_pips_favorable_removed / observations, 4)
+                if observations else None
+            ),
+        },
+        'sample_trades': example_rows,
+    }
+
+
+def _combine_conservative_scenarios(reports):
+    if not reports:
+        return {}
+    result = {}
+    for name in reports[0]:
+        counts = {key: sum(int(r[name][key]) for r in reports)
+                  for key in ('signals_generated', 'closed_trades', 'wins',
+                              'losses', 'draws', 'unresolved_price_or_time',
+                              'unresolved_expiry_candles')}
+        wins, losses, draws = counts['wins'], counts['losses'], counts['draws']
+        result[name] = {
+            **counts,
+            'win_rate_percent': (round(100 * wins / counts['closed_trades'], 2)
+                                 if counts['closed_trades'] else None),
+            'payout_analysis': _payout_analysis(wins, losses, draws),
+        }
+    return result
+
+
+@app.post('/api/backtest/conservative')
+def backtest_conservative_execution(req: BacktestRobustnessRequest):
+    """Compare historical observed fills with conservative no-gap-advantage fills.
+
+    No modification to strategy filters, production /api/signal or execution.
+    Use same weekly signal events as robustness and same expiry for ALL cases.
+    """
+    pair = req.pair.strip().upper()
+    if pair not in ALLOWED_PAIRS:
+        raise HTTPException(status_code=400, detail='Эта валютная пара не поддерживается')
+    expiry = req.expiry_timeframe.strip()
+    if expiry not in ('1min', '5min'):
+        raise HTTPException(status_code=400, detail='expiry_timeframe должен быть 1min или 5min')
+    week_results = []
+    failures = []
+    raw_reports = []
+    cooldown_reports = []
+    gap_flags = set()
+    gap_totals = {'verified_events': 0, 'favorable_gap_events': 0,
+                  'adverse_gap_events': 0, 'neutral_gap_events': 0,
+                  'total_favorable_pips_removed': 0.0}
+    gap_examples = []
+
+    for week_end in _last_completed_friday_anchors(req.weeks):
+        try:
+            raw = {
+                tf: get_market_data(pair, tf, outputsize=req.candles_per_week,
+                                    end_date=week_end.tz_convert('UTC'))
+                for tf in ANALYSIS_TIMEFRAMES
+            }
+            base = run_historical_backtest(
+                pair=pair, expiry_timeframe=expiry,
+                candle_count=req.candles_per_week, market_mode='regular_forex',
+                history_override=raw, collect_signal_events=True,
+            )
+            events = base.pop('_signal_events_for_comparison')
+            m1 = _regular_forex_filter(raw['1min'], '1min')
+            audit = _audit_execution_price_gaps(events, m1, pair, expiry)
+            gap_flags.update(audit['warnings'])
+            raw_test = _conservative_fill_test(events, m1, pair, expiry)
+            cooldown = _select_cooldown_events(events, req.cooldown_minutes)
+            cooldown_test = _conservative_fill_test(cooldown, m1, pair, expiry)
+            for k in gap_totals:
+                gap_totals[k] += raw_test['gap_dependency'][k]
+            raw_reports.append(raw_test['scenario_results'])
+            cooldown_reports.append(cooldown_test['scenario_results'])
+            gap_examples.extend(raw_test['sample_trades'])
+            week_results.append({
+                'week_end_new_york': week_end.isoformat(),
+                'evaluated_points': base['evaluated_points'],
+                'signals': len(events),
+                'after_cooldown': len(cooldown),
+                'time_audit': {
+                    'status': base['backtest_data_audit']['status'],
+                    'future_candle_violations': base['backtest_data_audit']['future_candle_violations'],
+                    'm1_window_alignment_violations': base['backtest_data_audit']['m1_window_alignment_violations'],
+                },
+                'price_audit': {
+                    'status': audit['status'], 'warnings': audit['warnings'],
+                    'mean_abs_signal_gap_pips': audit['gap_comparison']['mean_absolute_signal_gap_pips'],
+                    'mean_abs_baseline_gap_pips': audit['gap_comparison']['mean_absolute_baseline_gap_pips'],
+                    'baseline_observations': audit['all_adjacent_m1_close_to_next_open_gaps']['observations'],
+                },
+                'scenarios': raw_test['scenario_results'],
+                'cooldown_scenarios': cooldown_test['scenario_results'],
+            })
+        except HTTPException as exc:
+            if isinstance(exc.detail, dict) and exc.detail.get('error') == 'BACKTEST_LOOKAHEAD_BLOCKED':
+                raise
+            failures.append({'week_end_new_york': week_end.isoformat(),
+                             'status_code': exc.status_code,
+                             'error': make_json_safe(exc.detail)})
+        except ValueError as exc:
+            failures.append({'week_end_new_york': week_end.isoformat(),
+                             'status_code': 422, 'error': str(exc)})
+
+    if not week_results:
+        raise HTTPException(status_code=502,
+                            detail={'error': 'NO_VALID_WEEKS', 'failures': failures})
+    verified_events = gap_totals['verified_events']
+    gap_totals['total_favorable_pips_removed'] = round(
+        gap_totals['total_favorable_pips_removed'], 4)
+    gap_totals['avg_favorable_pips_removed_per_verified_signal'] = (
+        round(gap_totals['total_favorable_pips_removed'] / verified_events, 4)
+        if verified_events else None
+    )
+    gap_status = 'REVIEW_REQUIRED' if gap_flags else 'CHECKED'
+    return make_json_safe({
+        'strategy_version': VERSION,
+        'pair': pair, 'market_mode': 'regular_forex',
+        'expiry_timeframe': expiry,
+        'requested_weeks': req.weeks,
+        'completed_weeks': len(week_results),
+        'partial': bool(failures),
+        'candles_per_week_requested': req.candles_per_week,
+        'cooldown_minutes': req.cooldown_minutes,
+        'data_quality_status': gap_status,
+        'data_quality_warnings': sorted(gap_flags),
+        'live_trading_validation': 'NOT_VALIDATED',
+        'method': {
+            'reference_close': 'Non-executable reference: close of the signal candle',
+            'observed_next_open': 'Historical next M1 OPEN; NOT a broker execution price',
+            'no_favorable_gap': 'CALL=max(signal close, next open); PUT=min(signal close, next open)',
+            'no_favorable_gap_plus_0_2pip': 'No favorable gap + 0.2 pip adverse entry adjustment',
+            'no_favorable_gap_plus_0_5pip': 'No favorable gap + 0.5 pip adverse entry adjustment',
+            'expiry': 'All scenarios use the same closed M1 candle at entry clock T + expiry',
+        },
+        'overall': _combine_conservative_scenarios(raw_reports),
+        'cooldown_overall': _combine_conservative_scenarios(cooldown_reports),
+        'gap_dependency': gap_totals,
+        'sample_trades': gap_examples[:12],
+        'weeks': week_results,
+        'failures': failures,
+        'limitations': [
+            'Это консервативная оценка чувствительности, а не моделирование реального исполнения брокером.',
+            'Сценарий no_favorable_gap удаляет положительный эффект разницы Close→Open, но не устраняет прочие систематические погрешности.',
+            'Данные Twelve Data не являются котировками Pocket Option и не отражают OTC цены.',
+            'Не учитываются задержки 5–15 секунд, bid/ask, фактические выплаты и правила ничьих.',
+            'Четыре короткие недельные выборки и сигналы внутри одной недели не являются независимыми испытаниями.',
+            'Положительный результат теста не означает доказанную доходность; для живой торговли нужна независимая проверка исполнения.',
+            'Торговые фильтры и эндпоинт /api/signal не изменены.',
+        ],
+    })
+
+
+# ==================================================
 # HEALTH
 # ==================================================
 
@@ -3281,6 +3559,7 @@ def api_health():
         "execution_robustness_backtest": True,
         "execution_price_audit": True,
         "execution_gap_baseline_unit_safe": True,
+        "conservative_execution_backtest": True,
     }
 
 
