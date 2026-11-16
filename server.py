@@ -20,7 +20,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.1"
+VERSION = "2.4.2"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -54,6 +54,7 @@ ANALYSIS_TIMEFRAMES = ["1h", "15min", "5min", "1min"]
 CANDLE_LIMIT = 150
 BACKTEST_CANDLE_LIMIT = 5000
 SWING_LENGTH = 5
+M15_MEMORY_BARS = 8  # Срок жизни подтвержденного BOS/CHoCH после свечи пробоя
 CANDLE_SAFETY_SECONDS = 3
 
 MIN_SCORE = 70
@@ -357,19 +358,137 @@ def analyze_h1(df):
 # M15: STRUCTURE / BOS / CHoCH
 # ==================================================
 
+def _find_recent_m15_break(df, swing_highs, swing_lows):
+    """Находит самое новое пересечение подтвержденного swing за 0..8 M15 свечей.
+
+    Для каждой исторической свечи учитываются только pivots, которые были
+    подтверждены (SWING_LENGTH правых закрытых свечей) к моменту события.
+    Это предотвращает подглядывание в будущее при backtest и live-анализе.
+    События не сохраняются в памяти процесса: они восстанавливаются из OHLC.
+    """
+    close = df["close"].to_numpy(dtype=float)
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+    previous_close = np.r_[np.nan, close[:-1]]
+    true_range = np.nanmax(np.vstack([
+        high - low,
+        np.abs(high - previous_close),
+        np.abs(low - previous_close)
+    ]), axis=0)
+    atr_values = pd.Series(true_range).rolling(window=14, min_periods=14).mean().to_numpy()
+
+    newest_idx = len(df) - 1
+    oldest_idx = max(1, newest_idx - M15_MEMORY_BARS)
+
+    for i in range(newest_idx, oldest_idx - 1, -1):
+        # Максимум SWING_LENGTH свечей справа — к моменту i pivot уже известен.
+        cutoff = i - SWING_LENGTH
+        available_highs = [
+            item for item in swing_highs
+            if item[0] <= cutoff and i + 1 - item[0] <= 80
+        ]
+        available_lows = [
+            item for item in swing_lows
+            if item[0] <= cutoff and i + 1 - item[0] <= 80
+        ]
+        if len(available_highs) < 2 or len(available_lows) < 2:
+            continue
+
+        event_atr = float(atr_values[i])
+        if not math.isfinite(event_atr) or event_atr <= 0:
+            continue
+
+        high_level = float(available_highs[-1][1])
+        low_level = float(available_lows[-1][1])
+        buffer = max(event_atr * 0.03, abs(float(close[i])) * 0.00001)
+        high_threshold = high_level + buffer
+        low_threshold = low_level - buffer
+        bull_cross = bool(close[i - 1] <= high_threshold and close[i] > high_threshold)
+        bear_cross = bool(close[i - 1] >= low_threshold and close[i] < low_threshold)
+        if not bull_cross and not bear_cross:
+            continue
+
+        highs = [item[1] for item in available_highs[-2:]]
+        lows = [item[1] for item in available_lows[-2:]]
+        if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+            structure_at_event = "BULLISH"
+        elif highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+            structure_at_event = "BEARISH"
+        else:
+            structure_at_event = "RANGE_OR_MIXED"
+
+        if bull_cross and bear_cross:
+            return {
+                "signal": "WAIT",
+                "structure": "NONE",
+                "status": "CONFLICTING_CROSSES",
+                "reason_code": "CONFLICTING_BREAKS",
+                "event_index": i,
+                "event_candle_time": str(df.index[i]),
+                "age_bars": int(newest_idx - i),
+                "market_structure_at_event": structure_at_event,
+                "event_atr": event_atr,
+                "event_buffer": float(buffer),
+                "event_close": float(close[i]),
+                "level": None,
+                "threshold": None,
+                "invalidation_time": None,
+            }
+
+        direction = "CALL" if bull_cross else "PUT"
+        threshold = float(high_threshold if bull_cross else low_threshold)
+        broken_level = float(high_level if bull_cross else low_level)
+        # Старый сигнал нельзя активировать повторно после закрытия за уровнем
+        # в противоположную сторону. Новый пробой станет новым событием.
+        future_closes = close[i + 1:]
+        if direction == "CALL":
+            invalidations = np.flatnonzero(future_closes <= threshold)
+        else:
+            invalidations = np.flatnonzero(future_closes >= threshold)
+
+        invalidated = len(invalidations) > 0
+        invalidation_index = i + 1 + int(invalidations[0]) if invalidated else None
+        event_type = "CHoCH" if (
+            (direction == "CALL" and structure_at_event == "BEARISH") or
+            (direction == "PUT" and structure_at_event == "BULLISH")
+        ) else "BOS"
+
+        return {
+            "signal": "WAIT" if invalidated else direction,
+            "structure": event_type,
+            "status": "INVALIDATED" if invalidated else ("FRESH" if i == newest_idx else "REMEMBERED"),
+            "reason_code": "BREAK_INVALIDATED_BY_CLOSE" if invalidated else ("FRESH_CROSS" if i == newest_idx else "ACTIVE_RECENT_CROSS"),
+            "event_index": i,
+            "event_candle_time": str(df.index[i]),
+            "age_bars": int(newest_idx - i),
+            "market_structure_at_event": structure_at_event,
+            "event_atr": event_atr,
+            "event_buffer": float(buffer),
+            "event_close": float(close[i]),
+            "level": broken_level,
+            "threshold": threshold,
+            "invalidation_time": str(df.index[invalidation_index]) if invalidated else None,
+        }
+
+    return None
+
+
 def analyze_m15(df):
     swing_highs, swing_lows = find_confirmed_swings(df)
 
-    # Структура должна быть актуальной, а не построенной
-    # на уровнях из далёкой части графика.
-    recent_highs = [
-        item for item in swing_highs
-        if len(df) - item[0] <= 80
-    ]
-    recent_lows = [
-        item for item in swing_lows
-        if len(df) - item[0] <= 80
-    ]
+    recent_highs = [item for item in swing_highs if len(df) - item[0] <= 80]
+    recent_lows = [item for item in swing_lows if len(df) - item[0] <= 80]
+
+    memory_base = {
+        "memory_window_bars": M15_MEMORY_BARS,
+        "memory_status": "NO_RECENT_EVENT",
+        "event_age_bars": None,
+        "event_candle_time": None,
+        "event_level": None,
+        "event_break_threshold": None,
+        "market_structure_at_event": None,
+        "event_invalidation_time": None,
+    }
 
     if len(recent_highs) < 2 or len(recent_lows) < 2:
         return {
@@ -382,37 +501,22 @@ def analyze_m15(df):
             "confirmed_swing_highs": int(len(recent_highs)),
             "confirmed_swing_lows": int(len(recent_lows)),
             "bullish_break_detected": False,
-            "bearish_break_detected": False
+            "bearish_break_detected": False,
+            **memory_base
         }
 
     previous = df.iloc[-2]
     last = df.iloc[-1]
-
     high_index, high_level = recent_highs[-1]
     low_index, low_level = recent_lows[-1]
 
     high_values = [item[1] for item in recent_highs[-2:]]
     low_values = [item[1] for item in recent_lows[-2:]]
-
-    bullish_structure = (
-        high_values[-1] > high_values[-2]
-        and low_values[-1] > low_values[-2]
-    )
-
-    bearish_structure = (
-        high_values[-1] < high_values[-2]
-        and low_values[-1] < low_values[-2]
-    )
-
-    if bullish_structure:
-        market_structure = "BULLISH"
-    elif bearish_structure:
-        market_structure = "BEARISH"
-    else:
-        market_structure = "RANGE_OR_MIXED"
+    bullish_structure = high_values[-1] > high_values[-2] and low_values[-1] > low_values[-2]
+    bearish_structure = high_values[-1] < high_values[-2] and low_values[-1] < low_values[-2]
+    market_structure = "BULLISH" if bullish_structure else ("BEARISH" if bearish_structure else "RANGE_OR_MIXED")
 
     atr = calculate_atr(df)
-
     if atr <= 0:
         return {
             "signal": "WAIT",
@@ -424,20 +528,13 @@ def analyze_m15(df):
             "confirmed_swing_highs": int(len(recent_highs)),
             "confirmed_swing_lows": int(len(recent_lows)),
             "bullish_break_detected": False,
-            "bearish_break_detected": False
+            "bearish_break_detected": False,
+            **memory_base
         }
 
     buffer = max(atr * 0.03, abs(float(last["close"])) * 0.00001)
-
-    bullish_break = bool(
-        float(previous["close"]) <= high_level + buffer
-        and float(last["close"]) > high_level + buffer
-    )
-
-    bearish_break = bool(
-        float(previous["close"]) >= low_level - buffer
-        and float(last["close"]) < low_level - buffer
-    )
+    bullish_break = bool(float(previous["close"]) <= high_level + buffer and float(last["close"]) > high_level + buffer)
+    bearish_break = bool(float(previous["close"]) >= low_level - buffer and float(last["close"]) < low_level - buffer)
 
     common = {
         "market_structure": market_structure,
@@ -451,7 +548,6 @@ def analyze_m15(df):
         "confirmed_swing_lows": int(len(recent_lows)),
         "bullish_break_detected": bool(bullish_break),
         "bearish_break_detected": bool(bearish_break),
-        # Проверяем пересечение именно между двумя последними закрытыми M15.
         "previous_close": float(previous["close"]),
         "last_close": float(last["close"]),
         "last_candle_time": str(df.index[-1]),
@@ -459,75 +555,74 @@ def analyze_m15(df):
         "swing_low_time": str(df.index[low_index]),
         "bullish_break_threshold": float(high_level + buffer),
         "bearish_break_threshold": float(low_level - buffer),
-        "previous_at_or_below_bull_threshold": bool(
-            float(previous["close"]) <= high_level + buffer
-        ),
-        "last_above_bull_threshold": bool(
-            float(last["close"]) > high_level + buffer
-        ),
-        "previous_at_or_above_bear_threshold": bool(
-            float(previous["close"]) >= low_level - buffer
-        ),
-        "last_below_bear_threshold": bool(
-            float(last["close"]) < low_level - buffer
-        ),
-        "close_minus_bull_threshold": float(
-            float(last["close"]) - (high_level + buffer)
-        ),
-        "close_minus_bear_threshold": float(
-            float(last["close"]) - (low_level - buffer)
-        )
+        "previous_at_or_below_bull_threshold": bool(float(previous["close"]) <= high_level + buffer),
+        "last_above_bull_threshold": bool(float(last["close"]) > high_level + buffer),
+        "previous_at_or_above_bear_threshold": bool(float(previous["close"]) >= low_level - buffer),
+        "last_below_bear_threshold": bool(float(last["close"]) < low_level - buffer),
+        "close_minus_bull_threshold": float(float(last["close"]) - (high_level + buffer)),
+        "close_minus_bear_threshold": float(float(last["close"]) - (low_level - buffer)),
     }
 
-    if bullish_break and not bearish_break:
-        structure = (
-            "CHoCH" if market_structure == "BEARISH" else "BOS"
-        )
+    event = _find_recent_m15_break(df, swing_highs, swing_lows)
+    if event is None:
         return {
-            "signal": "CALL",
-            "structure": structure,
-            "reason": (
-                f"Бычий {structure}: закрытие выше подтвержденного Swing High"
-            ),
-            "score": 25,
-            "level": float(high_level),
-            "diagnostic_reason_code": "BULLISH_CONFIRMED_CROSS",
-            **common
+            "signal": "WAIT",
+            "structure": "NONE",
+            "reason": "Нет актуального BOS/CHoCH за последние 8 закрытых M15 свечей",
+            "diagnostic_reason_code": "NO_RECENT_CONFIRMED_CROSS",
+            "score": 0,
+            **common,
+            **memory_base,
         }
 
-    if bearish_break and not bullish_break:
-        structure = (
-            "CHoCH" if market_structure == "BULLISH" else "BOS"
+    memory = {
+        "memory_window_bars": M15_MEMORY_BARS,
+        "memory_status": event["status"],
+        "event_age_bars": event["age_bars"],
+        "event_candle_time": event["event_candle_time"],
+        "event_level": event["level"],
+        "event_break_threshold": event["threshold"],
+        "market_structure_at_event": event["market_structure_at_event"],
+        "event_invalidation_time": event["invalidation_time"],
+        "event_atr": event["event_atr"],
+        "event_buffer": event["event_buffer"],
+        "event_close": event["event_close"],
+        "memory_bars_remaining": max(0, M15_MEMORY_BARS - event["age_bars"]),
+    }
+
+    if event["signal"] == "WAIT":
+        reason = (
+            "Последний подтвержденный BOS/CHoCH отменен закрытием за пробитым уровнем"
+            if event["status"] == "INVALIDATED"
+            else "Противоречивые пробои на одной M15 свече"
         )
         return {
-            "signal": "PUT",
-            "structure": structure,
-            "reason": (
-                f"Медвежий {structure}: закрытие ниже подтвержденного Swing Low"
-            ),
-            "score": 25,
-            "level": float(low_level),
-            "diagnostic_reason_code": "BEARISH_CONFIRMED_CROSS",
-            **common
+            "signal": "WAIT",
+            "structure": "NONE",
+            "reason": reason,
+            "diagnostic_reason_code": event["reason_code"],
+            "score": 0,
+            **common,
+            **memory,
         }
 
-    if bullish_break and bearish_break:
-        reason = "Одновременно обнаружены противоположные условия пробоя"
-        diagnostic_reason_code = "CONFLICTING_BREAKS"
-    else:
-        reason = "Нет нового закрытого пробоя подтвержденного Swing High / Low"
-        diagnostic_reason_code = "NO_FRESH_CLOSED_CROSS"
+    direction = event["signal"]
+    structure = event["structure"]
+    label = "Бычий" if direction == "CALL" else "Медвежий"
+    reason = f"{label} {structure}: подтвержденный пробой M15"
+    if event["age_bars"] > 0:
+        reason += f" сохраняется {event['age_bars']} закрытых свечей"
 
     return {
-        "signal": "WAIT",
-        "structure": "NONE",
-        "market_structure": market_structure,
+        "signal": direction,
+        "structure": structure,
         "reason": reason,
-        "diagnostic_reason_code": diagnostic_reason_code,
-        "score": 0,
-        **common
+        "diagnostic_reason_code": event["reason_code"],
+        "score": 25,
+        "level": float(event["level"]),
+        **common,
+        **memory,
     }
-
 
 # ==================================================
 # M5: LIQUIDITY SWEEP
@@ -1194,6 +1289,7 @@ def get_signal(req: SignalRequest):
         "score": result["score"],
         "alignment": result["alignment"],
         "analysis": result["analysis"],
+        "decision_diagnostics": result["decision_diagnostics"],
         "virtual_trade": virtual_trade
     }
 
@@ -1316,6 +1412,8 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
     m15_market_structures = {}
     m15_swing_totals = {"highs": 0, "lows": 0, "observations": 0}
     m15_breaks = {"bullish": 0, "bearish": 0}
+    m15_memory_status_counts = {}  # Наблюдения, не уникальные торговые события
+    m15_memory_age_counts = {}
     m5_components = {
         "sweep_bullish": 0, "sweep_bearish": 0,
         "fvg_call": 0, "fvg_put": 0, "fvg_wait": 0,
@@ -1366,6 +1464,9 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
             m15_breaks["bullish"] += 1
         if m15.get("bearish_break_detected"):
             m15_breaks["bearish"] += 1
+        _increment_counter(m15_memory_status_counts, m15.get("memory_status", "UNKNOWN"))
+        if m15.get("memory_status") in ("FRESH", "REMEMBERED"):
+            _increment_counter(m15_memory_age_counts, m15.get("event_age_bars", "UNKNOWN"))
 
         # Диагностика отдельных моделей M5, включая конфликты направлений.
         m5 = analysis["M5"]
@@ -1475,7 +1576,10 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
                     "highs": round(m15_swing_totals["highs"] / m15_swing_totals["observations"], 2) if evaluated else 0,
                     "lows": round(m15_swing_totals["lows"] / m15_swing_totals["observations"], 2) if evaluated else 0
                 },
-                "break_detections": m15_breaks
+                "break_detections": m15_breaks,
+                "memory_window_bars": M15_MEMORY_BARS,
+                "memory_status_observations": m15_memory_status_counts,
+                "memory_age_observations": m15_memory_age_counts
             },
             "m5": m5_components,
             "m1": m1_filters,
@@ -1487,6 +1591,7 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
             "Комиссии, спред, проскальзывание и выплаты брокера не учитываются.",
             "Результат не гарантирует будущую доходность.",
             "Если сделок больше 200, в ответе показаны только первые 200; итоговая статистика учитывает все закрытые сделки.",
+            "Статистика M15 memory считает наблюдения на M1-срезах; это не уникальные события BOS/CHoCH.",
             "Диагностика показывает частоту условий фильтров, но сама по себе не доказывает прибыльность стратегии."
         ]
     }
