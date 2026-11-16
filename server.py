@@ -20,7 +20,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.2"
+VERSION = "2.4.3"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -808,10 +808,241 @@ def detect_order_block(df):
 
 
 # ==================================================
+# M5: DIAGNOSTICS ONLY (do not participate in scoring)
+# ==================================================
+
+def _diagnose_m5_sweep(df, atr):
+    last = df.iloc[-1]
+    highs, lows = find_confirmed_swings(df)
+    valid_history = bool(atr > 0 and len(df) >= 30)
+
+    def explain(side, swings):
+        if not valid_history:
+            return {"eligible": False, "reason": "INSUFFICIENT_HISTORY_OR_ATR"}
+        if not swings:
+            return {"eligible": False, "reason": "NO_CONFIRMED_SWING"}
+        index, level = swings[-1]
+        age = len(df) - index  # same age convention as signal detector
+        recent = age <= 30
+        if side == "bullish":
+            wick_threshold = float(level - atr * 0.03)
+            wick_pass = bool(float(last["low"]) < wick_threshold)
+            recovered = bool(float(last["close"]) > level)
+            candle_direction_pass = bool(float(last["close"]) > float(last["open"]))
+            wick_price = float(last["low"])
+        else:
+            wick_threshold = float(level + atr * 0.03)
+            wick_pass = bool(float(last["high"]) > wick_threshold)
+            recovered = bool(float(last["close"]) < level)
+            candle_direction_pass = bool(float(last["close"]) < float(last["open"]))
+            wick_price = float(last["high"])
+        missing = []
+        if not recent:
+            missing.append("SWING_OLDER_THAN_30_BARS")
+        if not wick_pass:
+            missing.append("NO_WICK_BEYOND_SWING_BUFFER")
+        if not recovered:
+            missing.append("CLOSE_DID_NOT_RECLAIM_SWING")
+        if not candle_direction_pass:
+            missing.append("CANDLE_DIRECTION_NOT_CONFIRMED")
+        return {
+            "eligible": True,
+            "swing_level": float(level),
+            "swing_time": str(df.index[index]),
+            "swing_age_bars": int(age),
+            "swing_recent": bool(recent),
+            "wick_price": wick_price,
+            "required_wick_threshold": wick_threshold,
+            "wick_condition_pass": wick_pass,
+            "close_reclaims_level": recovered,
+            "candle_direction_pass": candle_direction_pass,
+            "confirmed": bool(recent and wick_pass and recovered and candle_direction_pass),
+            "failed_checks": missing
+        }
+
+    return {
+        "bullish": explain("bullish", lows),
+        "bearish": explain("bearish", highs),
+        "required_wick_buffer": float(atr * 0.03) if atr > 0 else None,
+    }
+
+
+def _diagnose_m5_fvg(df, atr):
+    result = {
+        "lookback_candles": 10,
+        "minimum_gap_size": float(atr * 0.05) if atr > 0 else None,
+        "minimum_middle_body": float(atr * 0.5) if atr > 0 else None,
+        "bullish": {"valid_patterns": 0, "filled_patterns": 0, "outside_zone": 0, "latest_pattern": None},
+        "bearish": {"valid_patterns": 0, "filled_patterns": 0, "outside_zone": 0, "latest_pattern": None},
+        "detected_signal": "WAIT",
+    }
+    if len(df) < 20 or atr <= 0:
+        result["reason"] = "INSUFFICIENT_HISTORY_OR_ATR"
+        return result
+
+    start = max(2, len(df) - 10)
+    price = float(df["close"].iloc[-1])
+    # Same candle triples, order and thresholds as detect_fvg().
+    for i in range(len(df) - 1, start - 1, -1):
+        first, middle, third = df.iloc[i - 2], df.iloc[i - 1], df.iloc[i]
+        body = abs(float(middle["close"] - middle["open"]))
+        for direction in ("bullish", "bearish"):
+            if direction == "bullish":
+                gap = float(third["low"] - first["high"])
+                middle_direction = bool(float(middle["close"]) > float(middle["open"]))
+                lower = float(first["high"])
+                upper = float(third["low"])
+                zone_min, zone_max = lower - atr * 0.05, upper + atr * 0.25
+            else:
+                gap = float(first["low"] - third["high"])
+                middle_direction = bool(float(middle["close"]) < float(middle["open"]))
+                lower = float(third["high"])
+                upper = float(first["low"])
+                zone_min, zone_max = lower - atr * 0.25, upper + atr * 0.05
+            if not (gap >= atr * 0.05 and middle_direction and body >= atr * 0.5):
+                continue
+            later = df.iloc[i + 1:]
+            if direction == "bullish":
+                filled = bool(not later.empty and float(later["low"].min()) <= lower)
+            else:
+                filled = bool(not later.empty and float(later["high"].max()) >= upper)
+            near = bool(zone_min <= price <= zone_max)
+            bucket = result[direction]
+            bucket["valid_patterns"] += 1
+            if filled:
+                bucket["filled_patterns"] += 1
+            elif not near:
+                bucket["outside_zone"] += 1
+            pattern = {
+                "formation_time": str(df.index[i]),
+                "age_bars": int(len(df) - 1 - i),
+                "gap_size": float(gap),
+                "zone_low": float(lower),
+                "zone_high": float(upper),
+                "allowed_price_min": float(zone_min),
+                "allowed_price_max": float(zone_max),
+                "current_price": price,
+                "fully_filled": filled,
+                "price_in_entry_zone": near,
+                "active": bool(not filled and near),
+                "distance_to_entry_zone": float(max(zone_min - price, price - zone_max, 0.0)),
+            }
+            if bucket["latest_pattern"] is None:
+                bucket["latest_pattern"] = pattern
+            if not filled and near and result["detected_signal"] == "WAIT":
+                result["detected_signal"] = "CALL" if direction == "bullish" else "PUT"
+                result["selected_pattern"] = {"direction": direction, **pattern}
+    if result["detected_signal"] == "WAIT":
+        if not result["bullish"]["valid_patterns"] and not result["bearish"]["valid_patterns"]:
+            result["reason"] = "NO_VALID_GAP_WITH_MOMENTUM_IN_LAST_10_BARS"
+        else:
+            result["reason"] = "GAPS_FILLED_OR_PRICE_OUTSIDE_ENTRY_ZONES"
+    else:
+        result["reason"] = "ACTIVE_FVG_FOUND"
+    return result
+
+
+def _diagnose_m5_order_block(df, atr):
+    result = {
+        "lookback_candles": 15,
+        "minimum_following_body": float(atr * 0.7) if atr > 0 else None,
+        "maximum_zone_distance": float(atr * 0.15) if atr > 0 else None,
+        "bullish": {"valid_patterns": 0, "zone_revisits": 0, "latest_pattern": None},
+        "bearish": {"valid_patterns": 0, "zone_revisits": 0, "latest_pattern": None},
+        "detected_signal": "WAIT",
+    }
+    if len(df) < 30 or atr <= 0:
+        result["reason"] = "INSUFFICIENT_HISTORY_OR_ATR"
+        return result
+    last = df.iloc[-1]
+    close_price = float(last["close"])
+    # Match the candidate window and order in detect_order_block().
+    for i in range(len(df) - 4, max(5, len(df) - 15), -1):
+        candle = df.iloc[i]
+        following = df.iloc[i + 1:min(i + 4, len(df))]
+        previous = df.iloc[max(0, i - 5):i]
+        if following.empty or previous.empty:
+            continue
+        previous_high = float(previous["high"].max())
+        previous_low = float(previous["low"].min())
+        max_body = float((following["close"] - following["open"]).abs().max())
+        bullish_ob = bool(
+            float(candle["close"]) < float(candle["open"])
+            and float(following["close"].max()) > previous_high
+            and max_body >= atr * 0.7
+        )
+        bearish_ob = bool(
+            float(candle["close"]) > float(candle["open"])
+            and float(following["close"].min()) < previous_low
+            and max_body >= atr * 0.7
+        )
+        zone_low, zone_high = float(candle["low"]), float(candle["high"])
+        overlaps = bool(float(last["high"]) >= zone_low and float(last["low"]) <= zone_high)
+        distance = min(abs(close_price - zone_low), abs(close_price - zone_high))
+        near = bool(distance <= atr * 0.15)
+        for direction, formed in (("bullish", bullish_ob), ("bearish", bearish_ob)):
+            if not formed:
+                continue
+            bucket = result[direction]
+            bucket["valid_patterns"] += 1
+            if overlaps or near:
+                bucket["zone_revisits"] += 1
+            pattern = {
+                "formation_time": str(df.index[i]),
+                "age_bars": int(len(df) - 1 - i),
+                "zone_low": zone_low,
+                "zone_high": zone_high,
+                "previous_structure_high": previous_high,
+                "previous_structure_low": previous_low,
+                "max_following_body": max_body,
+                "last_candle_overlaps_zone": overlaps,
+                "close_near_zone": near,
+                "distance_to_zone_boundary": float(distance),
+                "entry_condition_pass": bool(overlaps or near),
+            }
+            if bucket["latest_pattern"] is None:
+                bucket["latest_pattern"] = pattern
+            if (overlaps or near) and result["detected_signal"] == "WAIT":
+                result["detected_signal"] = "CALL" if direction == "bullish" else "PUT"
+                result["selected_pattern"] = {"direction": direction, **pattern}
+    if result["detected_signal"] != "WAIT":
+        result["reason"] = "VALID_OB_AND_ZONE_RETEST"
+    elif not result["bullish"]["valid_patterns"] and not result["bearish"]["valid_patterns"]:
+        result["reason"] = "NO_ORDER_BLOCK_PATTERN_IN_CANDIDATE_WINDOW"
+    else:
+        result["reason"] = "PRICE_NOT_IN_ORDER_BLOCK_ZONE"
+    return result
+
+
+def diagnose_m5(df, sweep_call, sweep_put, fvg_signal, ob_signal):
+    """Information only. Never changes CALL, PUT, WAIT or scores."""
+    atr = calculate_atr(df)
+    if df is None or df.empty:
+        return {"reason": "NO_DATA"}
+    sweep = _diagnose_m5_sweep(df, atr)
+    fvg = _diagnose_m5_fvg(df, atr)
+    ob = _diagnose_m5_order_block(df, atr)
+    return {
+        "candle_time": str(df.index[-1]),
+        "m5_close": float(df["close"].iloc[-1]),
+        "atr": float(atr),
+        "liquidity_sweep": sweep,
+        "fvg": fvg,
+        "order_block": ob,
+        "consistency_checks": {
+            "sweep_bullish_matches": bool(sweep["bullish"].get("confirmed", False) == sweep_call),
+            "sweep_bearish_matches": bool(sweep["bearish"].get("confirmed", False) == sweep_put),
+            "fvg_matches": bool(fvg["detected_signal"] == fvg_signal),
+            "order_block_matches": bool(ob["detected_signal"] == ob_signal),
+        }
+    }
+
+
+# ==================================================
 # M5: COMBINED SETUP
 # ==================================================
 
-def analyze_m5(df):
+def analyze_m5(df, include_diagnostics=True):
     sweep_call, sweep_put = detect_liquidity_sweep(df)
     fvg_signal = detect_fvg(df)
     ob_signal = detect_order_block(df)
@@ -875,7 +1106,12 @@ def analyze_m5(df):
             "put_points_total": int(put_points),
             "directional_edge": int(edge),
             "minimum_edge_required": MIN_M5_SCORE_EDGE
-        }
+        },
+        **({
+            "diagnostics": diagnose_m5(
+                df, sweep_call, sweep_put, fvg_signal, ob_signal
+            )
+        } if include_diagnostics else {})
     }
 
 
@@ -1007,10 +1243,10 @@ def analyze_m1(df):
 # MULTI-TIMEFRAME ENGINE
 # ==================================================
 
-def analyze_multi_timeframe(data):
+def analyze_multi_timeframe(data, include_m5_diagnostics=True):
     h1 = analyze_h1(data["1h"])
     m15 = analyze_m15(data["15min"])
-    m5 = analyze_m5(data["5min"])
+    m5 = analyze_m5(data["5min"], include_diagnostics=include_m5_diagnostics)
     m1 = analyze_m1(data["1min"])
 
     components = {
@@ -1446,7 +1682,7 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
             continue
 
         evaluated += 1
-        result = analyze_multi_timeframe(window)
+        result = analyze_multi_timeframe(window, include_m5_diagnostics=False)
         analysis = result["analysis"]
 
         # Частота направлений каждого отдельного фильтра.
