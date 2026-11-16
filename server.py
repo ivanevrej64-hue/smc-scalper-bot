@@ -21,7 +21,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.7"
+VERSION = "2.4.8"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -122,6 +122,16 @@ class BacktestCompareRequest(BaseModel):
     pair: str = Field(default="EUR/USD")
     weeks: int = Field(default=2, ge=1, le=3)
     candles_per_week: int = Field(default=1500, ge=1000, le=3000)
+
+
+class BacktestRobustnessRequest(BaseModel):
+    # Only historical, completed regular-Forex weekly windows are tested.
+    pair: str = Field(default="EUR/USD")
+    weeks: int = Field(default=3, ge=1, le=6)
+    candles_per_week: int = Field(default=3000, ge=1000, le=3000)
+    expiry_timeframe: str = Field(default="1min")
+    # Treat signals closer than this as the same trading opportunity.
+    cooldown_minutes: int = Field(default=5, ge=0, le=30)
 
 
 # ==================================================
@@ -2495,6 +2505,356 @@ def compare_expiry_across_weeks(req: BacktestCompareRequest):
 
 
 # ==================================================
+# ROBUSTNESS BACKTEST: EXECUTION PROXIES AND COOLDOWN
+# ==================================================
+
+def _pip_size_for_pair(pair):
+    """Conventional pip sizes (0.01 for JPY-quote pairs, else 0.0001)."""
+    return 0.01 if pair.upper().endswith("/JPY") else 0.0001
+
+
+def _select_cooldown_events(events, cooldown_minutes):
+    """Select chronologically separated entries; no strategy rule is changed.
+
+    The original raw events are still included in the report. A cooldown is a
+    reporting variant only, not a new /api/signal condition.
+    """
+    ordered = sorted(events, key=lambda e: pd.Timestamp(e["entry_time"]))
+    accepted = []
+    previous = None
+    spacing = pd.Timedelta(minutes=cooldown_minutes)
+    for event in ordered:
+        timestamp = pd.Timestamp(event["entry_time"])
+        if timestamp.tzinfo is None:
+            raise ValueError("Robustness event timestamps must be timezone-aware")
+        if previous is None or timestamp - previous >= spacing:
+            accepted.append(event)
+            previous = timestamp
+    return accepted
+
+
+def _simulate_execution(events, m1, pair, expiry_timeframe,
+                        delay_minutes=0, adverse_slippage_pips=0.0,
+                        collect_hours=False):
+    """Evaluate an explicitly labeled *M1 candle-open execution proxy*.
+
+    No tick data exists, so no sub-minute latency or actual fill prices are
+    inferred. The original signal appears after a completed M1 candle (time T).
+    Entry is the M1 candle OPEN at T + delay_minutes, if present. Exit uses the
+    M1 close ending at entry time + requested expiry. An unfavorable pip offset
+    is applied to entry alone for sensitivity testing. Weekend gaps or missing
+    expiry candles produce UNRESOLVED, never invented WIN/LOSS results.
+    """
+    if expiry_timeframe not in ("1min", "5min"):
+        raise ValueError("Unsupported expiry timeframe")
+    if delay_minutes not in (0, 1):
+        raise ValueError("Execution delay must be 0 or 1 whole minute")
+    if adverse_slippage_pips not in (0.0, 0.2, 0.5):
+        raise ValueError("Unsupported slippage scenario")
+    pip = _pip_size_for_pair(pair)
+    counts = {"signals_generated": int(len(events)), "closed_trades": 0,
+              "unresolved_entry_candles": 0, "unresolved_expiry_candles": 0,
+              "wins": 0, "losses": 0, "draws": 0}
+    hour_counts = {}
+    gap_pips = []
+    gap_directional_pips = []
+    for event in events:
+        signal = event["signal"]
+        if signal not in ("CALL", "PUT"):
+            raise ValueError("Invalid historical signal direction")
+        signal_time = pd.Timestamp(event["entry_time"])
+        if signal_time.tzinfo is None:
+            raise ValueError("Robustness event time must be timezone-aware")
+        entry_time = signal_time + pd.Timedelta(minutes=delay_minutes)
+        # An entry candle must actually exist in the filtered regular-Forex M1.
+        if entry_time not in m1.index:
+            counts["unresolved_entry_candles"] += 1
+            continue
+        entry_row = m1.loc[entry_time]
+        if isinstance(entry_row, pd.DataFrame):
+            raise ValueError("Duplicate entry candle; cannot evaluate fill")
+        entry_open = float(entry_row["open"])
+        reference_close = float(event["entry_price"])
+        if delay_minutes == 0:
+            gap = (entry_open - reference_close) / pip
+            gap_pips.append(gap)
+            gap_directional_pips.append(gap if signal == "CALL" else -gap)
+
+        if signal == "CALL":
+            simulated_entry = entry_open + adverse_slippage_pips * pip
+        else:
+            simulated_entry = entry_open - adverse_slippage_pips * pip
+        if simulated_entry <= 0:
+            counts["unresolved_entry_candles"] += 1
+            continue
+        expiry_at = entry_time + TIMEFRAMES[expiry_timeframe]
+        exit_info = _m1_candle_at_expiry(m1, expiry_at)
+        if exit_info is None:
+            counts["unresolved_expiry_candles"] += 1
+            continue
+        outcome = _expiry_outcome(signal, simulated_entry, exit_info["exit_price"])
+        counts[{"WIN":"wins", "LOSS":"losses", "DRAW":"draws"}[outcome]] += 1
+        counts["closed_trades"] += 1
+        if collect_hours:
+            hour_key = entry_time.tz_convert(FX_MARKET_TIMEZONE).strftime("%H:00")
+            hour = hour_counts.setdefault(hour_key, {"wins": 0, "losses": 0, "draws": 0})
+            hour[{"WIN":"wins", "LOSS":"losses", "DRAW":"draws"}[outcome]] += 1
+
+    wins, losses, draws = (counts[k] for k in ("wins", "losses", "draws"))
+    closed = counts["closed_trades"]
+    result = {
+        **counts,
+        "win_rate_percent": round(wins * 100 / closed, 2) if closed else None,
+        "payout_analysis": _payout_analysis(wins, losses, draws),
+        "entry_basis": "M1_OPEN_AT_SIGNAL_CLOSE_PLUS_WHOLE_MINUTE_DELAY",
+        "expiry_basis": "M1_CLOSE_EXACTLY_AT_EXPIRY",
+        "delay_minutes": delay_minutes,
+        "adverse_slippage_pips": adverse_slippage_pips,
+    }
+    if collect_hours:
+        result["by_entry_hour_new_york"] = {
+            hour: {
+                **c,
+                "trades": sum(c.values()),
+                "win_rate_excluding_draws_percent": (
+                    round(100 * c["wins"] / (c["wins"] + c["losses"]), 2)
+                    if c["wins"] + c["losses"] else None
+                ),
+                "net_units_80pct_per_unit_stake": round(c["wins"] * 0.80 - c["losses"], 4),
+            }
+            for hour, c in sorted(hour_counts.items())
+        }
+        result["signal_close_to_next_open_gap_pips"] = {
+            "observations": len(gap_pips),
+            "mean_absolute": round(float(np.mean(np.abs(gap_pips))), 4) if gap_pips else None,
+            "max_absolute": round(float(np.max(np.abs(gap_pips))), 4) if gap_pips else None,
+            "mean_adverse_directional": round(float(np.mean(gap_directional_pips)), 4)
+                if gap_directional_pips else None,
+        }
+    return result
+
+
+def _robustness_result_summary(result):
+    """Compact snapshot for each weekly scenario."""
+    return {
+        k: result[k] for k in (
+            "signals_generated", "closed_trades", "unresolved_entry_candles",
+            "unresolved_expiry_candles", "wins", "losses", "draws", "win_rate_percent",
+            "payout_analysis"
+        )
+    }
+
+
+def _combine_robustness_reports(reports):
+    totals = {
+        "signals_generated": 0, "closed_trades": 0,
+        "unresolved_entry_candles": 0, "unresolved_expiry_candles": 0,
+        "wins": 0, "losses": 0, "draws": 0,
+    }
+    for report in reports:
+        for k in totals:
+            totals[k] += int(report[k])
+    wins, losses, draws = totals["wins"], totals["losses"], totals["draws"]
+    return {
+        **totals,
+        "win_rate_percent": (
+            round(100 * wins / totals["closed_trades"], 2)
+            if totals["closed_trades"] else None
+        ),
+        "payout_analysis": _payout_analysis(wins, losses, draws),
+    }
+
+
+@app.post("/api/backtest/robustness")
+def backtest_execution_robustness(req: BacktestRobustnessRequest):
+    """Separate historical weeks, entry sensitivity and cooldown selection.
+
+    Strategy generation is unmodified and uses the same historical engine.
+    Fractions of a minute cannot be backtested without tick/second data.
+    """
+    pair = req.pair.strip().upper()
+    if pair not in ALLOWED_PAIRS:
+        raise HTTPException(status_code=400, detail="Эта валютная пара не поддерживается")
+    expiry_timeframe = req.expiry_timeframe.strip()
+    if expiry_timeframe not in ("1min", "5min"):
+        raise HTTPException(status_code=400, detail="expiry_timeframe должен быть 1min или 5min")
+    scenarios = {
+        "next_open_0pip": (0, 0.0),
+        "next_open_0_2pip": (0, 0.2),
+        "next_open_0_5pip": (0, 0.5),
+        "one_minute_later_0pip": (1, 0.0),
+    }
+    week_results = []
+    failures = []
+    by_scenario = {name: [] for name in scenarios}
+    independent_by_scenario = {name: [] for name in scenarios}
+    legacy_results = []
+    overall_hours = {}
+    cooldown_hours = {}
+    overall_gap_pips = []
+    excluded_total = 0
+
+    for week_end in _last_completed_friday_anchors(req.weeks):
+        try:
+            raw = {
+                tf: get_market_data(
+                    pair, tf, outputsize=req.candles_per_week,
+                    end_date=week_end.tz_convert("UTC")
+                )
+                for tf in ANALYSIS_TIMEFRAMES
+            }
+            report = run_historical_backtest(
+                pair=pair,
+                expiry_timeframe=expiry_timeframe,
+                candle_count=req.candles_per_week,
+                market_mode="regular_forex",
+                history_override=raw,
+                collect_signal_events=True,
+            )
+            events = report.pop("_signal_events_for_comparison")
+            m1 = _regular_forex_filter(raw["1min"], "1min")
+            independent = _select_cooldown_events(events, req.cooldown_minutes)
+            week_reports = {}
+            independent_reports = {}
+            for name, (delay, slip) in scenarios.items():
+                details = _simulate_execution(
+                    events, m1, pair, expiry_timeframe,
+                    delay_minutes=delay, adverse_slippage_pips=slip,
+                    collect_hours=(name == "next_open_0pip"),
+                )
+                by_scenario[name].append(details)
+                week_reports[name] = _robustness_result_summary(details)
+                ind = _simulate_execution(
+                    independent, m1, pair, expiry_timeframe,
+                    delay_minutes=delay, adverse_slippage_pips=slip,
+                    collect_hours=(name == "next_open_0pip"),
+                )
+                independent_by_scenario[name].append(ind)
+                independent_reports[name] = _robustness_result_summary(ind)
+                if name == "next_open_0pip":
+                    for hour, counts in ind["by_entry_hour_new_york"].items():
+                        total = cooldown_hours.setdefault(hour, {"wins": 0, "losses": 0, "draws": 0})
+                        for key in total:
+                            total[key] += int(counts[key])
+                    for hour, counts in details["by_entry_hour_new_york"].items():
+                        total = overall_hours.setdefault(hour, {"wins": 0, "losses": 0, "draws": 0})
+                        for key in total:
+                            total[key] += int(counts[key])
+                    gap = details["signal_close_to_next_open_gap_pips"]
+                    if gap["observations"]:
+                        overall_gap_pips.append({
+                            "week_end_new_york": week_end.isoformat(), **gap,
+                        })
+            baseline_legacy = {
+                "signals_generated": report["signals_generated"],
+                "closed_trades": report["closed_trades"],
+                "unresolved_entry_candles": 0,
+                "unresolved_expiry_candles": report["unresolved_expiry_candles"],
+                "wins": report["wins"], "losses": report["losses"], "draws": report["draws"],
+            }
+            legacy_results.append(baseline_legacy)
+            excluded_total += len(events) - len(independent)
+            week_results.append({
+                "week_end_new_york": week_end.isoformat(),
+                "week_end_utc": week_end.tz_convert("UTC").isoformat(),
+                "evaluated_points": report["evaluated_points"],
+                "signals_generated": len(events),
+                "independent_signals": len(independent),
+                "excluded_by_cooldown": len(events) - len(independent),
+                "data_audit": {
+                    "status": report["backtest_data_audit"]["status"],
+                    "warnings": report["backtest_data_audit"]["warnings"],
+                    "future_candle_violations": report["backtest_data_audit"]["future_candle_violations"],
+                    "m1_window_alignment_violations": report["backtest_data_audit"]["m1_window_alignment_violations"],
+                },
+                "legacy_close_price_entry": _combine_robustness_reports([baseline_legacy]),
+                "scenarios": week_reports,
+                "cooldown_scenarios": independent_reports,
+            })
+        except HTTPException as exc:
+            if isinstance(exc.detail, dict) and exc.detail.get("error") == "BACKTEST_LOOKAHEAD_BLOCKED":
+                raise
+            failures.append({
+                "week_end_new_york": week_end.isoformat(),
+                "status_code": exc.status_code,
+                "error": make_json_safe(exc.detail),
+            })
+
+    if not week_results:
+        raise HTTPException(
+            status_code=502,
+            detail={"error":"NO_VALID_WEEKS", "failures": failures},
+        )
+    hour_result = {
+        hour: {
+            **counts, "trades": sum(counts.values()),
+            "win_rate_excluding_draws_percent": (
+                round(counts["wins"] * 100 / (counts["wins"] + counts["losses"]), 2)
+                if counts["wins"] + counts["losses"] else None
+            ),
+            "net_units_80pct_per_unit_stake": round(counts["wins"] * 0.8 - counts["losses"], 4),
+        }
+        for hour, counts in sorted(overall_hours.items())
+    }
+    cooldown_hour_result = {
+        hour: {
+            **counts, "trades": sum(counts.values()),
+            "win_rate_excluding_draws_percent": (
+                round(counts["wins"] * 100 / (counts["wins"] + counts["losses"]), 2)
+                if counts["wins"] + counts["losses"] else None
+            ),
+            "net_units_80pct_per_unit_stake": round(counts["wins"] * 0.8 - counts["losses"], 4),
+        }
+        for hour, counts in sorted(cooldown_hours.items())
+    }
+    return make_json_safe({
+        "strategy_version": VERSION,
+        "pair": pair,
+        "expiry_timeframe": expiry_timeframe,
+        "requested_weeks": req.weeks,
+        "completed_weeks": len(week_results),
+        "partial": bool(failures),
+        "candles_per_week_requested": req.candles_per_week,
+        "market_mode": "regular_forex",
+        "cooldown_minutes": req.cooldown_minutes,
+        "execution_proxy": (
+            "Signal computed after M1 close T. Execute at the next available M1 candle "
+            "open T, or after a full 1-minute delay at T+1min; optional adverse "
+            "0.2/0.5 pip entry-price shift. No second-level/tick fills are modeled."
+        ),
+        "legacy_close_price_entry": _combine_robustness_reports(legacy_results),
+        "overall": {
+            name: _combine_robustness_reports(results)
+            for name, results in by_scenario.items()
+        },
+        "independent_cooldown": {
+            "excluded_signals_by_cooldown": excluded_total,
+            "by_entry_hour_new_york": cooldown_hour_result,
+            "overall": {
+                name: _combine_robustness_reports(results)
+                for name, results in independent_by_scenario.items()
+            },
+        },
+        "by_entry_hour_new_york": hour_result,
+        "weekly_price_gap_diagnostics": overall_gap_pips,
+        "weeks": week_results,
+        "failures": failures,
+        "limitations": [
+            "Диагностика исполнения приблизительная: M1 OHLC не содержит цены через 5/10/15 секунд после сигнала.",
+            "Вариант next_open использует цену открытия следующей минутной свечи, но не реальный брокерский fill.",
+            "Вариант one_minute_later меняет момент входа на +1 минуту, экспирация отсчитывается от нового входа.",
+            "Сдвиг цены 0.2/0.5 пипса — стресс-сценарий, не фактическая оценка проскальзывания.",
+            "Cooldown отбирает разнесённые сигналы для анализа; это не гарантия статистической независимости и не изменение /api/signal.",
+            "Ранее исследованные недели не являются независимой от подбора модели контрольной выборкой.",
+            "Одна неделя — лишь выборка до candles_per_week свечей, не полные пять дней.",
+            "Не учитываются отдельные правила Pocket Option, OTC, реальные выплаты и задержки платформы.",
+            "Ничьи считаются возвратом ставки; соседние сигналы статистически зависимы.",
+            "Отчёт по часам основан на небольшом числе сигналов, использовать его как подбор лучших часов нельзя без внешней проверки.",
+        ],
+    })
+
+
+# ==================================================
 # HEALTH
 # ==================================================
 
@@ -2516,6 +2876,7 @@ def api_health():
         "backtest_slice_engine": "pandas_datetime_searchsorted_v2",
         "regular_forex_sessions": True,
         "weekly_expiry_comparison": True,
+        "execution_robustness_backtest": True,
     }
 
 
