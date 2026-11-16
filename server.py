@@ -20,7 +20,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.5"
+VERSION = "2.4.6"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -1625,25 +1625,35 @@ def get_virtual_trades(
 # ==================================================
 
 def _closed_candle_slice(df, timeframe, evaluation_time, max_rows=150):
+    """Only candles closed by `evaluation_time`, never later.
+
+    Twelve Data stamps the *open* of each OHLC candle. For a candle to
+    be visible at evaluation_time, open + timeframe <= evaluation_time.
+    An explicit Pandas time-index lookup avoids mixing raw timestamp units.
+    This helper also independently validates its own output: fail closed
+    rather than silently backtest on future candles.
     """
-    Возвращает только свечи, которые уже закрылись к evaluation_time.
-    Индекс Twelve Data трактуется как время открытия свечи.
-    """
+    evaluation_time = pd.Timestamp(evaluation_time)
+    if evaluation_time.tzinfo is None:
+        raise ValueError("Backtest evaluation_time must be timezone-aware UTC")
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("Backtest candles must have a DatetimeIndex")
+    if df.index.tz is None:
+        raise ValueError("Backtest candle indexes must be timezone-aware UTC")
+    if not df.index.is_monotonic_increasing or not df.index.is_unique:
+        raise ValueError("Backtest candles must be chronologically sorted and unique")
+
     duration = TIMEFRAMES[timeframe]
-    latest_allowed_open = evaluation_time - duration
-
-    end_position = int(
-        np.searchsorted(
-            df.index.asi8,
-            latest_allowed_open.value,
-            side="right"
+    last_allowed_open = evaluation_time - duration
+    # Native timestamp search on Pandas DatetimeIndex, not nanosecond int64.
+    end = int(df.index.searchsorted(last_allowed_open, side="right"))
+    result = df.iloc[max(0, end - max_rows):end]
+    if len(result) and result.index[-1] + duration > evaluation_time:
+        raise RuntimeError(
+            f"LOOKAHEAD_BLOCKED: {timeframe}: last_open={result.index[-1]} "
+            f"evaluation_time={evaluation_time}"
         )
-    )
-
-    if end_position <= 0:
-        return df.iloc[0:0]
-
-    return df.iloc[max(0, end_position - max_rows):end_position]
+    return result
 
 
 def _increment_counter(counter, key):
@@ -1788,6 +1798,38 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
         if any(len(window[tf]) < 60 for tf in ANALYSIS_TIMEFRAMES):
             skipped += 1
             continue
+
+        # Independent time guard: every single evaluation must be chronological.
+        # If one slice is wrong, STOP immediately; a backtest based on future
+        # candles must never return plausible-looking WIN/LOSS/WAIT statistics.
+        bad_windows = {
+            tf: {
+                "last_open": window[tf].index[-1].isoformat(),
+                "should_be_closed_by": evaluation_time.isoformat(),
+            }
+            for tf in ANALYSIS_TIMEFRAMES
+            if window[tf].index[-1] + TIMEFRAMES[tf] > evaluation_time
+        }
+        if window["1min"].index[-1] != m1_open_time:
+            bad_windows["1min"] = {
+                "last_open": window["1min"].index[-1].isoformat(),
+                "expected_open": m1_open_time.isoformat(),
+            }
+        if bad_windows:
+            logger.error(
+                "Backtest chronological guard failed: pair=%s index=%d %s",
+                pair, i, bad_windows,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "BACKTEST_LOOKAHEAD_BLOCKED",
+                    "message": "Некорректные временные срезы: будущие свечи или M1 не совпадает с проверяемым моментом",
+                    "evaluation_time": evaluation_time.isoformat(),
+                    "bad_windows": bad_windows,
+                    "strategy_version": VERSION,
+                },
+            )
 
         evaluated += 1
         result = analyze_multi_timeframe(window, include_m5_diagnostics=False)
@@ -2000,9 +2042,22 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
             audit_warnings.append("IDENTICAL_SIGNAL_DIAGNOSTICS_AT_ALL_TIMES")
         if len(audit_m1_close_values) == 1:
             audit_warnings.append("IDENTICAL_M1_CLOSE_AT_ALL_TIMES")
+    if audit_temporal_violations or audit_m1_window_mismatch:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "BACKTEST_LOOKAHEAD_BLOCKED",
+                "message": "Исторические свечи содержат будущее относительно времени проверки",
+                "future_candle_violations": audit_temporal_violations,
+                "m1_window_alignment_violations": audit_m1_window_mismatch,
+                "strategy_version": VERSION,
+            },
+        )
     audit = {
         "status": "SUSPICIOUS" if audit_warnings else "CHECKED",
         "warnings": audit_warnings,
+        "slice_engine": "pandas_datetime_searchsorted_v2",
+        "integrity_guard_enabled": True,
         "time_basis": "UTC; Twelve Data candles indexed by opening time",
         "history_ranges": {
             tf: {
@@ -2140,7 +2195,8 @@ def api_health():
     return {
         "status": "online",
         "version": VERSION,
-        "twelvedata_key_configured": bool(TWELVEDATA_KEY)
+        "twelvedata_key_configured": bool(TWELVEDATA_KEY),
+        "backtest_slice_engine": "pandas_datetime_searchsorted_v2"
     }
 
 
