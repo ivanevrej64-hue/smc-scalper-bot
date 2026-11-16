@@ -20,7 +20,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -311,6 +311,7 @@ def analyze_h1(df):
     fast = float(ema20.iloc[-1])
     slow = float(ema50.iloc[-1])
 
+    # Условия стратегии НЕ изменены.
     if price > fast > slow:
         signal = "CALL"
         reason = "Бычье направление: цена выше EMA20, EMA20 выше EMA50"
@@ -324,14 +325,33 @@ def analyze_h1(df):
         reason = "EMA не подтверждают единое направление"
         score = 0
 
+    if signal != "WAIT":
+        block_reason = None
+    elif fast > slow:
+        block_reason = "EMA20 выше EMA50, но закрытие H1 не выше EMA20"
+    elif fast < slow:
+        block_reason = "EMA20 ниже EMA50, но закрытие H1 не ниже EMA20"
+    else:
+        block_reason = "EMA20 и EMA50 совпадают"
+
     return {
         "signal": signal,
         "reason": reason,
         "score": score,
         "ema20": fast,
-        "ema50": slow
+        "ema50": slow,
+        "h1_close": price,
+        "h1_candle_time": str(df.index[-1]),
+        "close_minus_ema20": float(price - fast),
+        "ema20_minus_ema50": float(fast - slow),
+        "close_above_ema20": bool(price > fast),
+        "close_below_ema20": bool(price < fast),
+        "ema20_above_ema50": bool(fast > slow),
+        "ema20_below_ema50": bool(fast < slow),
+        "call_condition_pass": bool(price > fast > slow),
+        "put_condition_pass": bool(price < fast < slow),
+        "block_reason": block_reason
     }
-
 
 # ==================================================
 # M15: STRUCTURE / BOS / CHoCH
@@ -357,6 +377,7 @@ def analyze_m15(df):
             "structure": "NONE",
             "market_structure": "UNKNOWN",
             "reason": "Недостаточно актуальных подтвержденных Swing High / Low",
+            "diagnostic_reason_code": "NOT_ENOUGH_CONFIRMED_SWINGS",
             "score": 0,
             "confirmed_swing_highs": int(len(recent_highs)),
             "confirmed_swing_lows": int(len(recent_lows)),
@@ -398,6 +419,7 @@ def analyze_m15(df):
             "structure": "NONE",
             "market_structure": market_structure,
             "reason": "Не удалось рассчитать ATR для проверки пробоя",
+            "diagnostic_reason_code": "ATR_NOT_AVAILABLE",
             "score": 0,
             "confirmed_swing_highs": int(len(recent_highs)),
             "confirmed_swing_lows": int(len(recent_lows)),
@@ -428,7 +450,33 @@ def analyze_m15(df):
         "confirmed_swing_highs": int(len(recent_highs)),
         "confirmed_swing_lows": int(len(recent_lows)),
         "bullish_break_detected": bool(bullish_break),
-        "bearish_break_detected": bool(bearish_break)
+        "bearish_break_detected": bool(bearish_break),
+        # Проверяем пересечение именно между двумя последними закрытыми M15.
+        "previous_close": float(previous["close"]),
+        "last_close": float(last["close"]),
+        "last_candle_time": str(df.index[-1]),
+        "swing_high_time": str(df.index[high_index]),
+        "swing_low_time": str(df.index[low_index]),
+        "bullish_break_threshold": float(high_level + buffer),
+        "bearish_break_threshold": float(low_level - buffer),
+        "previous_at_or_below_bull_threshold": bool(
+            float(previous["close"]) <= high_level + buffer
+        ),
+        "last_above_bull_threshold": bool(
+            float(last["close"]) > high_level + buffer
+        ),
+        "previous_at_or_above_bear_threshold": bool(
+            float(previous["close"]) >= low_level - buffer
+        ),
+        "last_below_bear_threshold": bool(
+            float(last["close"]) < low_level - buffer
+        ),
+        "close_minus_bull_threshold": float(
+            float(last["close"]) - (high_level + buffer)
+        ),
+        "close_minus_bear_threshold": float(
+            float(last["close"]) - (low_level - buffer)
+        )
     }
 
     if bullish_break and not bearish_break:
@@ -443,6 +491,7 @@ def analyze_m15(df):
             ),
             "score": 25,
             "level": float(high_level),
+            "diagnostic_reason_code": "BULLISH_CONFIRMED_CROSS",
             **common
         }
 
@@ -458,19 +507,23 @@ def analyze_m15(df):
             ),
             "score": 25,
             "level": float(low_level),
+            "diagnostic_reason_code": "BEARISH_CONFIRMED_CROSS",
             **common
         }
 
     if bullish_break and bearish_break:
         reason = "Одновременно обнаружены противоположные условия пробоя"
+        diagnostic_reason_code = "CONFLICTING_BREAKS"
     else:
         reason = "Нет нового закрытого пробоя подтвержденного Swing High / Low"
+        diagnostic_reason_code = "NO_FRESH_CLOSED_CROSS"
 
     return {
         "signal": "WAIT",
         "structure": "NONE",
         "market_structure": market_structure,
         "reason": reason,
+        "diagnostic_reason_code": diagnostic_reason_code,
         "score": 0,
         **common
     }
@@ -748,7 +801,8 @@ def analyze_m1(df):
             "breakout_call": False,
             "breakout_put": False,
             "body_filter_pass": False,
-            "range_filter_pass": False
+            "range_filter_pass": False,
+            "failed_checks": ["NO_RECENT_CANDLES_OR_INVALID_ATR"]
         }
 
     body = abs(float(last["close"] - last["open"]))
@@ -762,13 +816,15 @@ def analyze_m1(df):
             "breakout_call": False,
             "breakout_put": False,
             "body_filter_pass": False,
-            "range_filter_pass": False
+            "range_filter_pass": False,
+            "failed_checks": ["ZERO_CANDLE_RANGE"]
         }
 
     body_ratio = body / candle_range
     normal_range = candle_range <= atr * 2.5
     strong_body = body >= atr * 0.2 and body_ratio >= 0.35
 
+    # Исходные формулы пробоя сохранены без изменений.
     bullish_breakout = bool(
         float(last["close"]) > float(last["open"])
         and float(last["close"]) > float(recent["high"].max()) + atr * 0.03
@@ -781,6 +837,23 @@ def analyze_m1(df):
     bullish = bool(bullish_breakout and strong_body and normal_range)
     bearish = bool(bearish_breakout and strong_body and normal_range)
 
+    close_price = float(last["close"])
+    open_price = float(last["open"])
+    recent_high = float(recent["high"].max())
+    recent_low = float(recent["low"].min())
+    call_threshold = float(recent_high + atr * 0.03)
+    put_threshold = float(recent_low - atr * 0.03)
+
+    failed_checks = []
+    if not bullish_breakout and not bearish_breakout:
+        failed_checks.append("NO_FOUR_CANDLE_BREAKOUT")
+    if body < atr * 0.2:
+        failed_checks.append("BODY_BELOW_MINIMUM_ATR")
+    if body_ratio < 0.35:
+        failed_checks.append("BODY_RATIO_BELOW_0_35")
+    if not normal_range:
+        failed_checks.append("CANDLE_RANGE_TOO_LARGE")
+
     diagnostics = {
         "breakout_call": bullish_breakout,
         "breakout_put": bearish_breakout,
@@ -788,7 +861,22 @@ def analyze_m1(df):
         "range_filter_pass": bool(normal_range),
         "candle_range_atr": round(candle_range / atr, 3),
         "body_atr": round(body / atr, 3),
-        "body_ratio": round(body_ratio, 3)
+        "body_ratio": round(body_ratio, 3),
+        "m1_candle_time": str(df.index[-1]),
+        "open": open_price,
+        "close": close_price,
+        "atr": float(atr),
+        "previous_4_high": recent_high,
+        "previous_4_low": recent_low,
+        "call_breakout_threshold": call_threshold,
+        "put_breakout_threshold": put_threshold,
+        "close_minus_call_threshold": float(close_price - call_threshold),
+        "close_minus_put_threshold": float(close_price - put_threshold),
+        "body_size": float(body),
+        "minimum_body_size": float(atr * 0.2),
+        "minimum_body_ratio": 0.35,
+        "max_normal_candle_range": float(atr * 2.5),
+        "failed_checks": failed_checks
     }
 
     if bullish:
@@ -819,7 +907,6 @@ def analyze_m1(df):
         "score": 0,
         **diagnostics
     }
-
 
 # ==================================================
 # MULTI-TIMEFRAME ENGINE
@@ -912,7 +999,25 @@ def analyze_multi_timeframe(data):
             "M1": m1["signal"],
             "all_timeframes_aligned": len(set(directions)) == 1
         },
-        "analysis": components
+        "analysis": components,
+        "decision_diagnostics": {
+            "CALL": {
+                "blocking_timeframes": [
+                    tf for tf, component in components.items()
+                    if component["signal"] != "CALL"
+                ],
+                "score_shortfall": max(0, MIN_SCORE - int(call_score))
+            },
+            "PUT": {
+                "blocking_timeframes": [
+                    tf for tf, component in components.items()
+                    if component["signal"] != "PUT"
+                ],
+                "score_shortfall": max(0, MIN_SCORE - int(put_score))
+            },
+            "all_timeframes_required": True,
+            "minimum_score_required": MIN_SCORE
+        }
     }
 
 
