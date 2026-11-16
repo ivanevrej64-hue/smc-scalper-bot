@@ -21,7 +21,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.12"
+VERSION = "2.4.13"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -3565,11 +3565,12 @@ def api_health():
         "paper_api_key_configured": len(PAPER_API_KEY) >= 16,
         "paper_mode": "DEMO_ONLY",
         "paper_capture_requires_authenticated_scan": True,
+        "paper_scan_monitoring": True,
     }
 
 
 # ==================================================
-# v2.4.12 — FORWARD PAPER TEST (DEMO JOURNAL)
+# v2.4.13 — FORWARD PAPER TEST + EXTERNAL SCAN MONITORING
 # ==================================================
 # This extension intentionally does NOT change SMC signal calculations,
 # historical backtest logic, or the existing public /api/signal endpoint.
@@ -3629,6 +3630,21 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     notes TEXT,
     updated_at_utc TEXT NOT NULL,
     UNIQUE (pair, side, expiry_timeframe, signal_candle_open_utc)
+)
+"""
+
+
+PAPER_SCAN_DDL = """
+CREATE TABLE IF NOT EXISTS paper_scan_runs (
+    id TEXT PRIMARY KEY,
+    pair TEXT NOT NULL,
+    expiry_timeframe TEXT NOT NULL,
+    scanned_at_utc TEXT NOT NULL,
+    result_status TEXT NOT NULL,
+    signal_candle_open_utc TEXT,
+    trade_id TEXT,
+    reason TEXT NOT NULL,
+    strategy_version TEXT NOT NULL
 )
 """
 
@@ -3740,6 +3756,8 @@ def _paper_initialize():
         with _paper_db() as conn:
             _paper_exec(conn, PAPER_DDL)
             _paper_exec(conn, "CREATE INDEX IF NOT EXISTS paper_status_idx ON paper_trades(status, observed_at_utc)")
+            _paper_exec(conn, PAPER_SCAN_DDL)
+            _paper_exec(conn, "CREATE INDEX IF NOT EXISTS paper_runs_time_idx ON paper_scan_runs(scanned_at_utc)")
         _PAPER_DB_READY = True
 
 
@@ -3779,6 +3797,62 @@ def _paper_public_trade(row):
     return make_json_safe(result)
 
 
+def _paper_record_scan_result(pair: str, timeframe: str, result: dict, candle_time=None, reason=""):
+    """Persist observed scans, including WAIT. Never insert synthetic trades.
+
+    Scan logging must not cause a confirmed paper opportunity to be lost if
+    the scan-log insert itself encounters a transient database issue.
+    """
+    try:
+        status = str(result.get("status", "UNKNOWN"))
+        trade = result.get("trade") or {}
+        with _paper_db() as conn:
+            _paper_exec(conn, """
+                INSERT INTO paper_scan_runs (
+                    id, pair, expiry_timeframe, scanned_at_utc, result_status,
+                    signal_candle_open_utc, trade_id, reason, strategy_version
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                str(uuid.uuid4()), pair, timeframe, _paper_iso(_paper_now()),
+                status, str(candle_time) if candle_time is not None else None,
+                trade.get("id"), str(reason or result.get("reason") or "")[:500], VERSION,
+            ))
+    except Exception:
+        logger.exception("Paper scan was processed but monitoring log could not be saved")
+    return result
+
+
+@app.get("/api/paper/monitor", dependencies=[Depends(_paper_auth)])
+def paper_monitor(limit: int = Query(default=12, ge=1, le=50)):
+    """Report actual API scans, not assumed external scheduler availability."""
+    _paper_initialize()
+    cutoff = _paper_iso(_paper_now() - pd.Timedelta(hours=24))
+    with _paper_db() as conn:
+        recent = _paper_exec(conn, """
+            SELECT id, pair, expiry_timeframe, scanned_at_utc, result_status,
+                   signal_candle_open_utc, trade_id, reason, strategy_version
+            FROM paper_scan_runs ORDER BY scanned_at_utc DESC LIMIT ?
+        """, (limit,)).fetchall()
+        counts = _paper_exec(conn, """
+            SELECT result_status, COUNT(*) AS n FROM paper_scan_runs
+            WHERE scanned_at_utc >= ? GROUP BY result_status
+        """, (cutoff,)).fetchall()
+        total = _paper_exec(conn, "SELECT COUNT(*) AS n FROM paper_scan_runs").fetchone()["n"]
+    runs = [_paper_dict(row) for row in recent]
+    return {
+        "version": VERSION,
+        "mode": "DEMO_ONLY",
+        "scheduler": "EXTERNAL_REQUIRED_NOT_VERIFIED",
+        "total_logged_scans": int(total),
+        "last_scan_at_utc": runs[0]["scanned_at_utc"] if runs else None,
+        "last_scan_status": runs[0]["result_status"] if runs else None,
+        "scans_last_24_hours": int(sum(row["n"] for row in counts)),
+        "status_counts_last_24_hours": {row["result_status"]: int(row["n"]) for row in counts},
+        "recent_scans": runs,
+        "note": "Shows authenticated scan calls, whether automatic or manual. No broker execution.",
+    }
+
+
 @app.get("/api/paper/health", dependencies=[Depends(_paper_auth)])
 def paper_health():
     _paper_initialize()
@@ -3786,7 +3860,7 @@ def paper_health():
         count = _paper_exec(conn, "SELECT COUNT(*) AS n FROM paper_trades").fetchone()["n"]
     return {"status": "READY", "version": VERSION, "storage": PAPER_DB_TYPE,
             "stored_trades": int(count), "automation": "EXTERNAL_SCHEDULER_REQUIRED",
-            "mode": "DEMO_ONLY"}
+            "mode": "DEMO_ONLY", "scan_monitoring": True}
 
 
 @app.post("/api/paper/scan", dependencies=[Depends(_paper_auth)])
@@ -3804,9 +3878,11 @@ def paper_scan(req: PaperScanRequest):
     signal_data = get_signal(SignalRequest(pair=pair, timeframe=timeframe))
     side = signal_data["signal"]
     if side not in ("CALL", "PUT"):
-        return {"status": "WAIT", "stored": False, "pair": pair,
-                "reason": signal_data["reason"], "candle_time": signal_data["candle_time"],
-                "strategy_version": VERSION}
+        return _paper_record_scan_result(pair, timeframe, {
+            "status": "WAIT", "stored": False, "pair": pair,
+            "reason": signal_data["reason"], "candle_time": signal_data["candle_time"],
+            "strategy_version": VERSION,
+        }, candle_time=signal_data["candle_time"], reason=signal_data["reason"])
 
     observed_at = _paper_now()
     candle_open = _paper_time(signal_data["candle_time"])
@@ -3815,9 +3891,11 @@ def paper_scan(req: PaperScanRequest):
     if age_seconds < -1:
         raise HTTPException(status_code=409, detail="Signal candle has not yet closed")
     if age_seconds > PAPER_MAX_SIGNAL_AGE_SECONDS:
-        return {"status": "STALE_SKIPPED", "stored": False, "pair": pair,
-                "side": side, "age_seconds": round(age_seconds, 2),
-                "max_age_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS}
+        return _paper_record_scan_result(pair, timeframe, {
+            "status": "STALE_SKIPPED", "stored": False, "pair": pair,
+            "side": side, "age_seconds": round(age_seconds, 2),
+            "max_age_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS,
+        }, candle_time=signal_data["candle_time"], reason="Signal too old")
 
     score = signal_data.get("score") or {}
     trade_id = str(uuid.uuid4())
@@ -3842,9 +3920,11 @@ def paper_scan(req: PaperScanRequest):
             SELECT * FROM paper_trades WHERE pair=? AND side=? AND expiry_timeframe=? AND signal_candle_open_utc=?
         """, (pair,side,timeframe,_paper_iso(candle_open))).fetchone()
         result = _paper_public_trade(_paper_dict(row))
-    return {"status": "CAPTURED" if result["id"] == trade_id else "ALREADY_CAPTURED",
-            "stored": True, "trade": result,
-            "note": "Observation only. Enter DEMO fill and exit manually. No real order is placed."}
+    return _paper_record_scan_result(pair, timeframe, {
+        "status": "CAPTURED" if result["id"] == trade_id else "ALREADY_CAPTURED",
+        "stored": True, "trade": result,
+        "note": "Observation only. Enter DEMO fill and exit manually. No real order is placed.",
+    }, candle_time=signal_data["candle_time"], reason=signal_data["reason"])
 
 
 @app.post("/api/paper/trades/{trade_id}/entry", dependencies=[Depends(_paper_auth)])
