@@ -21,7 +21,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.9"
+VERSION = "2.4.10"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -2718,11 +2718,23 @@ def _audit_execution_price_gaps(events, m1, pair, expiry_timeframe):
     tolerance = max(pip * 1e-5, 1e-12)
     close = m1["close"].to_numpy(dtype=float)
     opening = m1["open"].to_numpy(dtype=float)
-    ns = m1.index.asi8
-    deltas = ns[1:] - ns[:-1]
-    valid = deltas == int(step.value)
+    # IMPORTANT: .asi8 uses the index's underlying datetime unit (ns/us/ms/s),
+    # whereas Timedelta.value always uses nanoseconds. Comparing the raw ints
+    # incorrectly produced ZERO adjacent candles on some pandas versions.
+    # Compare actual timestamps directly so this works for any datetime unit.
+    valid = np.asarray((m1.index[1:] - m1.index[:-1]) == step, dtype=bool)
     # Only CONSECUTIVE fully closed M1 candles, never crossing weekends/gaps.
     adjacent_gaps = ((opening[1:] - close[:-1]) / pip)[valid].tolist()
+    adjacent_pairs = int(np.count_nonzero(valid))
+    baseline_coverage = {
+        "m1_candles": int(len(m1)),
+        "candidate_pairs": max(0, int(len(m1)) - 1),
+        "one_minute_adjacent_pairs": adjacent_pairs,
+        "nonadjacent_pairs": max(0, int(len(m1)) - 1 - adjacent_pairs),
+        "datetime_index_dtype": str(m1.index.dtype),
+        "comparison_method": "timestamp_timedelta_equality_unit_independent",
+        "sufficient_for_baseline": bool(adjacent_pairs >= 100),
+    }
     rows = []
     all_gaps = []
     adverse_gaps = []
@@ -2821,6 +2833,8 @@ def _audit_execution_price_gaps(events, m1, pair, expiry_timeframe):
         alerts.append("SYSTEMATIC_FAVORABLE_NEXT_OPEN_FOR_SIGNAL_DIRECTION")
     if len(adverse_gaps) >= 8 and favorable / len(adverse_gaps) >= 0.80:
         alerts.append("UNUSUAL_FAVORABLE_GAP_FRACTION_AT_SIGNALS")
+    if len(adjacent_gaps) < 100:
+        alerts.append("INSUFFICIENT_ADJACENT_M1_BASELINE")
     if len(adjacent_gaps) >= 100 and float(np.mean(np.abs(adjacent_gaps))) >= 0.30:
         alerts.append("MATERIAL_GAPS_COMMON_IN_UNFILTERED_M1_DATA")
     if len(all_gaps) >= 8 and float(np.mean(np.abs(all_gaps))) >= 0.50:
@@ -2854,6 +2868,17 @@ def _audit_execution_price_gaps(events, m1, pair, expiry_timeframe):
             },
         },
         "all_adjacent_m1_close_to_next_open_gaps": _pip_summary(adjacent_gaps),
+        "baseline_coverage": baseline_coverage,
+        "gap_comparison": {
+            "mean_absolute_signal_gap_pips": round(float(np.mean(np.abs(all_gaps))), 5) if all_gaps else None,
+            "mean_absolute_baseline_gap_pips": round(float(np.mean(np.abs(adjacent_gaps))), 5) if adjacent_gaps else None,
+            "signal_vs_baseline_mean_abs_ratio": round(
+                float(np.mean(np.abs(all_gaps)) / np.mean(np.abs(adjacent_gaps))), 3
+            ) if all_gaps and adjacent_gaps and float(np.mean(np.abs(adjacent_gaps))) > 1e-9 else None,
+            "baseline_positive_gap_fraction_percent": round(
+                100 * sum(g > 1e-8 for g in adjacent_gaps) / len(adjacent_gaps), 2
+            ) if adjacent_gaps else None,
+        },
         "outcome_effect_same_expiry": {
             "compared_settled_trades": len(rows),
             "outcome_changed_count": changes,
@@ -2974,6 +2999,8 @@ def backtest_execution_price_audit(req: BacktestRobustnessRequest):
     gap_warnings = []
     if len(agg_adverse) >= 8 and np.mean(agg_adverse) <= -0.25:
         gap_warnings.append("SYSTEMATIC_FAVORABLE_NEXT_OPEN_FOR_SIGNAL_DIRECTION")
+    if len(agg_adjacent) < 100:
+        gap_warnings.append("INSUFFICIENT_ADJACENT_M1_BASELINE")
     if len(agg_adjacent) >= 100 and np.mean(np.abs(agg_adjacent)) >= 0.30:
         gap_warnings.append("MATERIAL_GAPS_COMMON_IN_UNFILTERED_M1_DATA")
     if len(agg_raw) >= 8 and np.mean(np.abs(agg_raw)) >= 0.50:
@@ -3002,6 +3029,17 @@ def backtest_execution_price_audit(req: BacktestRobustnessRequest):
                 "neutral": int(sum(abs(v) <= 1e-8 for v in agg_adverse)),
             },
             "baseline_all_adjacent_m1_gaps": _pip_summary(agg_adjacent),
+            "baseline_comparison": {
+                "mean_abs_signal_gap_pips": round(float(np.mean(np.abs(agg_raw))), 5) if agg_raw else None,
+                "mean_abs_baseline_gap_pips": round(float(np.mean(np.abs(agg_adjacent))), 5) if agg_adjacent else None,
+                "signal_vs_baseline_abs_gap_ratio": round(
+                    float(np.mean(np.abs(agg_raw)) / np.mean(np.abs(agg_adjacent))), 3
+                ) if agg_raw and agg_adjacent and float(np.mean(np.abs(agg_adjacent))) > 1e-9 else None,
+                "baseline_positive_gap_fraction_percent": round(
+                    100 * sum(v > 1e-8 for v in agg_adjacent) / len(agg_adjacent), 2
+                ) if agg_adjacent else None,
+                "baseline_adequate": len(agg_adjacent) >= 100,
+            },
             "data_consistency": aggregate_consistency,
             "outcome_effect_same_expiry": {
                 "close_entry": total_wins_close,
@@ -3023,6 +3061,7 @@ def backtest_execution_price_audit(req: BacktestRobustnessRequest):
             "Для close-entry и next-open-entry используется ОДНА И ТА ЖЕ свеча экспирации.",
             "Систематически выгодный next-open может быть следствием смещения котировок или правил формирования свечей.",
             "Исторические сигналы близки по времени и не являются независимыми наблюдениями.",
+            "Соседние M1 свечи сравниваются по разнице времён, независимо от единиц хранения pandas DatetimeIndex.",
             "Ни один показатель аудита не изменяет торговые фильтры или реальные /api/signal ответы.",
         ],
     })
@@ -3241,6 +3280,7 @@ def api_health():
         "weekly_expiry_comparison": True,
         "execution_robustness_backtest": True,
         "execution_price_audit": True,
+        "execution_gap_baseline_unit_safe": True,
     }
 
 
