@@ -20,7 +20,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.3"
+VERSION = "2.4.4"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -1353,6 +1353,32 @@ def analyze_multi_timeframe(data, include_m5_diagnostics=True):
 
 
 # ==================================================
+# M1 EXPIRY ALIGNMENT
+# ==================================================
+
+def _m1_candle_at_expiry(m1_df, expiry_at):
+    """Return the *closed* M1 candle ending exactly at expiry_at.
+
+    Twelve Data indexes candles by opening time. Never take the first candle
+    opening *after* expiry: that would shift virtual/backtest outcomes by a minute.
+    Return None when the precise candle is missing (weekend/data gap/history).
+    The caller is responsible for ensuring input M1 candles are already closed.
+    """
+    expiry_at = pd.Timestamp(expiry_at)
+    expected_open = expiry_at - TIMEFRAMES["1min"]
+    if expected_open not in m1_df.index:
+        return None
+    row = m1_df.loc[expected_open]
+    if isinstance(row, pd.DataFrame):
+        row = row.iloc[-1]
+    return {
+        "exit_time": expiry_at.isoformat(),
+        "exit_candle_open_time": expected_open.isoformat(),
+        "exit_price": float(row["close"]),
+    }
+
+
+# ==================================================
 # VIRTUAL TRADE MANAGEMENT
 # ==================================================
 
@@ -1363,13 +1389,18 @@ def settle_virtual_trades(pair, m1_df):
 
         expiry_at = pd.Timestamp(trade["expiry_at"])
 
-        eligible = m1_df[m1_df.index >= expiry_at]
-        if eligible.empty:
+        # Input only contains fully closed candles. Exact expiry required.
+        if m1_df.empty or m1_df.index[-1] + TIMEFRAMES["1min"] < expiry_at:
+            continue
+        exit_data = _m1_candle_at_expiry(m1_df, expiry_at)
+        if exit_data is None:
+            # Candle missing: claiming a win/loss from the next candle is invalid.
+            trade["status"] = "UNRESOLVED"
+            trade["outcome"] = "EXPIRY_CANDLE_MISSING"
             continue
 
-        exit_candle = eligible.iloc[0]
-        exit_time = eligible.index[0]
-        exit_price = float(exit_candle["close"])
+        exit_time = expiry_at
+        exit_price = exit_data["exit_price"]
         entry_price = float(trade["entry_price"])
 
         if trade["signal"] == "CALL":
@@ -1391,6 +1422,7 @@ def settle_virtual_trades(pair, m1_df):
         trade["outcome"] = outcome
         trade["exit_price"] = exit_price
         trade["exit_time"] = exit_time.isoformat()
+        trade["exit_candle_open_time"] = exit_data["exit_candle_open_time"]
         trade["price_change"] = round(exit_price - entry_price, 8)
 
         logger.info("Virtual trade settled: %s %s", pair, outcome)
@@ -1567,6 +1599,7 @@ def get_virtual_trades(
     losses = sum(1 for trade in closed if trade["outcome"] == "LOSS")
     draws = sum(1 for trade in closed if trade["outcome"] == "DRAW")
     open_count = sum(1 for trade in trades if trade["status"] == "OPEN")
+    unresolved_count = sum(1 for trade in trades if trade["status"] == "UNRESOLVED")
 
     win_rate = (
         round(wins / len(closed) * 100, 2)
@@ -1577,6 +1610,7 @@ def get_virtual_trades(
         "strategy_version": VERSION,
         "total_trades": len(trades),
         "open_trades": open_count,
+        "unresolved_trades": unresolved_count,
         "closed_trades": len(closed),
         "wins": wins,
         "losses": losses,
@@ -1617,6 +1651,44 @@ def _increment_counter(counter, key):
     counter[key] = int(counter.get(key, 0)) + 1
 
 
+def _classify_evaluation_stage(result):
+    """One disjoint reason per M1 evaluation; H1 -> M15 -> M5 -> M1."""
+    a = result["analysis"]
+    h1 = a["H1"]["signal"]
+    if h1 == "WAIT":
+        return "H1_WAIT"
+    m15 = a["M15"]["signal"]
+    if m15 == "WAIT":
+        return "M15_WAIT"
+    if m15 != h1:
+        return "M15_OPPOSITE"
+    m5 = a["M5"]["signal"]
+    if m5 == "WAIT":
+        return "M5_WAIT"
+    if m5 != h1:
+        return "M5_OPPOSITE"
+    m1 = a["M1"]["signal"]
+    if m1 == "WAIT":
+        return "M1_WAIT"
+    if m1 != h1:
+        return "M1_OPPOSITE"
+    return "SIGNAL" if result["signal"] in ("CALL", "PUT") else "SCORE_BELOW_70"
+
+
+def _new_funnel_counts():
+    return {
+        "H1_WAIT": 0,
+        "M15_WAIT": 0,
+        "M15_OPPOSITE": 0,
+        "M5_WAIT": 0,
+        "M5_OPPOSITE": 0,
+        "M1_WAIT": 0,
+        "M1_OPPOSITE": 0,
+        "SCORE_BELOW_70": 0,
+        "SIGNAL": 0,
+    }
+
+
 def run_historical_backtest(pair, expiry_timeframe, candle_count):
     history = {
         tf: get_market_data(pair, tf, outputsize=candle_count)
@@ -1638,7 +1710,30 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
     wins = 0
     losses = 0
     draws = 0
+    unresolved_expiry = 0
     trades = []
+
+    # These are *M1 evaluation observations*, not unique H1/M15/M5 events.
+    evaluation_funnel = _new_funnel_counts()
+    directional_funnel = {
+        side: {
+            "h1_direction": 0,
+            "h1_m15_aligned": 0,
+            "h1_m15_m5_aligned": 0,
+            "all_four_aligned": 0,
+            "confirmed_signals": 0,
+        }
+        for side in ("CALL", "PUT")
+    }
+    m5_wait_reasons = {
+        "unique_closed_m5_candles": 0,
+        "fvg_reasons": {},
+        "order_block_reasons": {},
+        "sweep_failed_checks": {},
+        "diagnostic_mismatch_counts": {},
+    }
+    m1_entry_wait_checks = {"evaluations": 0, "failed_checks": {}}
+    diagnosed_m5_candles = set()
 
     timeframe_signals = {
         tf: {"CALL": 0, "PUT": 0, "WAIT": 0}
@@ -1733,6 +1828,53 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
             if fail_key:
                 m1_filters[fail_key] += 1
 
+        # Disjoint funnel stages: each snapshot counted once.
+        stage = _classify_evaluation_stage(result)
+        evaluation_funnel[stage] += 1
+        side = analysis["H1"]["signal"]
+        if side in directional_funnel:
+            dfunnel = directional_funnel[side]
+            dfunnel["h1_direction"] += 1
+            if analysis["M15"]["signal"] == side:
+                dfunnel["h1_m15_aligned"] += 1
+                if analysis["M5"]["signal"] == side:
+                    dfunnel["h1_m15_m5_aligned"] += 1
+                    if analysis["M1"]["signal"] == side:
+                        dfunnel["all_four_aligned"] += 1
+                        if result["signal"] == side:
+                            dfunnel["confirmed_signals"] += 1
+
+            # Rich M5 diagnostics only when this is the first blocking stage;
+            # deduplicate by closed M5 candle + direction to avoid counting
+            # the same M5 observation once per M1 minute.
+            if stage == "M5_WAIT":
+                m5_key = (window["5min"].index[-1], side)
+                if m5_key not in diagnosed_m5_candles:
+                    diagnosed_m5_candles.add(m5_key)
+                    diag = diagnose_m5(
+                        window["5min"],
+                        bool(m5["liquidity_sweep"]["bullish"]),
+                        bool(m5["liquidity_sweep"]["bearish"]),
+                        m5["fvg"], m5["order_block"]
+                    )
+                    m5_wait_reasons["unique_closed_m5_candles"] += 1
+                    _increment_counter(m5_wait_reasons["fvg_reasons"],
+                                       diag["fvg"].get("reason", "UNKNOWN"))
+                    _increment_counter(m5_wait_reasons["order_block_reasons"],
+                                       diag["order_block"].get("reason", "UNKNOWN"))
+                    sweep_side = "bullish" if side == "CALL" else "bearish"
+                    for check in diag["liquidity_sweep"][sweep_side].get("failed_checks", []):
+                        _increment_counter(m5_wait_reasons["sweep_failed_checks"], check)
+                    for check, passed in diag["consistency_checks"].items():
+                        if not passed:
+                            _increment_counter(m5_wait_reasons["diagnostic_mismatch_counts"], check)
+
+            # We analyze M1 blockers only after H1, M15 and M5 all agree.
+            if stage == "M1_WAIT":
+                m1_entry_wait_checks["evaluations"] += 1
+                for check in m1_analysis.get("failed_checks", []):
+                    _increment_counter(m1_entry_wait_checks["failed_checks"], check)
+
         _increment_counter(final_signals, result["signal"])
         if result["signal"] == "WAIT":
             _increment_counter(final_wait_reasons, result["reason"])
@@ -1742,13 +1884,15 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
         entry_price = float(m1.iloc[i]["close"])
         entry_time = m1_open_time + TIMEFRAMES["1min"]
         expiry_at = entry_time + expiry_duration
-        future = m1[m1.index >= expiry_at]
-
-        if future.empty:
+        # Exact expiration price: M1 candle opens at expiry - 1m and
+        # closes at expiry. Missing candle means unresolved, never a guess.
+        exit_data = _m1_candle_at_expiry(m1, expiry_at)
+        if exit_data is None:
+            unresolved_expiry += 1
             continue
 
-        exit_time = future.index[0]
-        exit_price = float(future.iloc[0]["close"])
+        exit_time = expiry_at
+        exit_price = exit_data["exit_price"]
 
         if result["signal"] == "CALL":
             if exit_price > entry_price:
@@ -1779,6 +1923,7 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
                 "entry_price": entry_price,
                 "expiry_at": expiry_at.isoformat(),
                 "exit_time": exit_time.isoformat(),
+                "exit_candle_open_time": exit_data["exit_candle_open_time"],
                 "exit_price": exit_price,
                 "outcome": outcome,
                 "score": result["score"]
@@ -1797,6 +1942,9 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
         "skipped_points_insufficient_history": skipped,
         "signals_generated": signals,
         "closed_trades": closed_trades,
+        "unresolved_expiry_candles": unresolved_expiry,
+        "signals_per_1000_evaluations": round(signals * 1000 / evaluated, 2) if evaluated else 0,
+        "signal_rate_percent": round(signals * 100 / evaluated, 3) if evaluated else 0,
         "wins": wins,
         "losses": losses,
         "draws": draws,
@@ -1820,7 +1968,21 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
             "m5": m5_components,
             "m1": m1_filters,
             "final_signal_counts": final_signals,
-            "final_wait_reasons": final_wait_reasons
+            "final_wait_reasons": final_wait_reasons,
+            "wait_funnel": {
+                "evaluations": evaluated,
+                "stages": evaluation_funnel,
+                "directional": directional_funnel,
+                "description": (
+                    "Каждая проверенная закрытая M1 свеча учитывается один раз; "
+                    "ступени воронки взаимоисключающие. H1/M15/M5 события "
+                    "могут повторяться в разных M1 наблюдениях."
+                ),
+            },
+            "targeted_blockers": {
+                "m5_when_h1_m15_aligned": m5_wait_reasons,
+                "m1_when_h1_m15_m5_aligned": m1_entry_wait_checks,
+            }
         },
         "limitations": [
             "Backtest использует доступную историю Twelve Data и текущие правила стратегии.",
@@ -1828,7 +1990,10 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
             "Результат не гарантирует будущую доходность.",
             "Если сделок больше 200, в ответе показаны только первые 200; итоговая статистика учитывает все закрытые сделки.",
             "Статистика M15 memory считает наблюдения на M1-срезах; это не уникальные события BOS/CHoCH.",
-            "Диагностика показывает частоту условий фильтров, но сама по себе не доказывает прибыльность стратегии."
+            "Диагностика показывает частоту условий фильтров, но сама по себе не доказывает прибыльность стратегии.",
+            "Экспирация измеряется по закрытию M1 свечи ровно в момент expiry_at; если такой свечи нет, исход остаётся неопределённым.",
+            "Статистика воронки — по проверкам M1, а не независимым торговым возможностям; соседние проверки статистически зависимы.",
+            "WIN/LOSS не учитывает цену входа/выхода на брокере и скорость исполнения."
         ]
     }
 
