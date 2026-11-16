@@ -21,7 +21,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.11"
+VERSION = "2.4.12"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -3560,7 +3560,481 @@ def api_health():
         "execution_price_audit": True,
         "execution_gap_baseline_unit_safe": True,
         "conservative_execution_backtest": True,
+        "forward_paper_test": True,
+        "paper_storage_configured": (PAPER_DB_TYPE == "postgres" or (PAPER_DB_TYPE == "sqlite" and (not os.getenv("RENDER") or os.getenv("PAPER_SQLITE_PERSISTENT_ACK") == "YES"))),
+        "paper_api_key_configured": len(PAPER_API_KEY) >= 16,
+        "paper_mode": "DEMO_ONLY",
+        "paper_capture_requires_authenticated_scan": True,
     }
+
+
+# ==================================================
+# v2.4.12 — FORWARD PAPER TEST (DEMO JOURNAL)
+# ==================================================
+# This extension intentionally does NOT change SMC signal calculations,
+# historical backtest logic, or the existing public /api/signal endpoint.
+# It records *observed forward* opportunities only when an authenticated
+# client explicitly invokes POST /api/paper/scan.
+
+import csv
+import hmac
+import io
+import sqlite3
+import threading
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from fastapi import Depends, Header
+from fastapi.responses import Response
+
+PAPER_API_KEY = os.getenv("PAPER_API_KEY", "")
+PAPER_DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+PAPER_SQLITE_PATH = os.getenv("PAPER_SQLITE_PATH", "").strip()
+PAPER_MAX_SIGNAL_AGE_SECONDS = 90
+PAPER_DB_TYPE = "postgres" if PAPER_DATABASE_URL else ("sqlite" if PAPER_SQLITE_PATH else "disabled")
+_PAPER_DB_READY = False
+_PAPER_DB_LOCK = threading.Lock()
+
+PAPER_DDL = """
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id TEXT PRIMARY KEY,
+    pair TEXT NOT NULL,
+    side TEXT NOT NULL,
+    expiry_timeframe TEXT NOT NULL,
+    signal_candle_open_utc TEXT NOT NULL,
+    signal_available_at_utc TEXT NOT NULL,
+    observed_at_utc TEXT NOT NULL,
+    signal_age_seconds DOUBLE PRECISION NOT NULL,
+    signal_close DOUBLE PRECISION NOT NULL,
+    signal_reason TEXT NOT NULL,
+    score_call INTEGER NOT NULL,
+    score_put INTEGER NOT NULL,
+    strategy_version TEXT NOT NULL,
+    analysis_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    entry_at_utc TEXT,
+    entry_price DOUBLE PRECISION,
+    expiry_at_utc TEXT,
+    stake DOUBLE PRECISION,
+    payout_percent DOUBLE PRECISION,
+    broker TEXT,
+    exit_at_utc TEXT,
+    exit_price DOUBLE PRECISION,
+    price_outcome TEXT,
+    broker_outcome TEXT,
+    effective_outcome TEXT,
+    net_profit DOUBLE PRECISION,
+    entry_adverse_gap_pips DOUBLE PRECISION,
+    void_reason TEXT,
+    notes TEXT,
+    updated_at_utc TEXT NOT NULL,
+    UNIQUE (pair, side, expiry_timeframe, signal_candle_open_utc)
+)
+"""
+
+
+class PaperScanRequest(BaseModel):
+    pair: str = Field(default="EUR/USD")
+    timeframe: str = Field(default="1min")
+
+
+class PaperEntryRequest(BaseModel):
+    entry_at_utc: datetime
+    entry_price: float = Field(gt=0, allow_inf_nan=False)
+    stake: float = Field(default=1.0, gt=0, le=100000, allow_inf_nan=False)
+    payout_percent: float = Field(default=80.0, ge=0, le=100, allow_inf_nan=False)
+    broker: str = Field(default="DEMO", min_length=1, max_length=100)
+    expiry_at_utc: datetime | None = None
+    notes: str = Field(default="", max_length=500)
+
+
+class PaperExitRequest(BaseModel):
+    exit_at_utc: datetime
+    exit_price: float = Field(gt=0, allow_inf_nan=False)
+    broker_outcome: str | None = Field(default=None)
+    notes: str = Field(default="", max_length=500)
+
+
+class PaperVoidRequest(BaseModel):
+    reason: str = Field(min_length=5, max_length=500)
+
+
+def _paper_auth(x_paper_key: str | None = Header(default=None, alias="X-Paper-Key")):
+    # Authentication is required even to list/export paper results.
+    if len(PAPER_API_KEY) < 16:
+        raise HTTPException(status_code=503, detail="Configure PAPER_API_KEY (minimum 16 characters) in Render")
+    if not x_paper_key:
+        raise HTTPException(status_code=401, detail="X-Paper-Key header is required")
+    if not hmac.compare_digest(PAPER_API_KEY, x_paper_key):
+        raise HTTPException(status_code=403, detail="Invalid paper API key")
+    return True
+
+
+def _paper_require_storage_config():
+    if PAPER_DB_TYPE == "disabled":
+        raise HTTPException(
+            status_code=503,
+            detail="Configure DATABASE_URL (Postgres) or PAPER_SQLITE_PATH on a persistent disk; do not use an ephemeral Render filesystem",
+        )
+    if PAPER_DB_TYPE == "sqlite" and os.getenv("RENDER") and os.getenv("PAPER_SQLITE_PERSISTENT_ACK") != "YES":
+        raise HTTPException(
+            status_code=503,
+            detail="For SQLite on Render, attach a persistent disk and set PAPER_SQLITE_PERSISTENT_ACK=YES",
+        )
+
+
+@contextmanager
+def _paper_db():
+    _paper_require_storage_config()
+    if PAPER_DB_TYPE == "postgres":
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError:
+            raise HTTPException(status_code=503, detail="Install psycopg[binary] in requirements.txt")
+        try:
+            with psycopg.connect(PAPER_DATABASE_URL, row_factory=dict_row, connect_timeout=8) as conn:
+                yield conn
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("Paper Postgres connection/operation error")
+            raise HTTPException(status_code=503, detail="Paper Postgres is unavailable") from exc
+    else:
+        path = Path(PAPER_SQLITE_PATH).expanduser().resolve()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(path), timeout=15)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=15000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("Paper SQLite connection/operation error")
+            raise HTTPException(status_code=503, detail="Paper SQLite is unavailable") from exc
+
+
+def _paper_exec(conn, sql, params=()):
+    if PAPER_DB_TYPE == "postgres":
+        sql = sql.replace("?", "%s")
+    return conn.execute(sql, params)
+
+
+def _paper_initialize():
+    global _PAPER_DB_READY
+    if _PAPER_DB_READY:
+        return
+    with _PAPER_DB_LOCK:
+        if _PAPER_DB_READY:
+            return
+        with _paper_db() as conn:
+            _paper_exec(conn, PAPER_DDL)
+            _paper_exec(conn, "CREATE INDEX IF NOT EXISTS paper_status_idx ON paper_trades(status, observed_at_utc)")
+        _PAPER_DB_READY = True
+
+
+def _paper_iso(value):
+    # ISO-8601 UTC, preserving microseconds; strict timezone required.
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None or pd.isna(ts):
+        raise HTTPException(status_code=422, detail="Time must include an explicit timezone, e.g. +00:00")
+    return ts.tz_convert("UTC").isoformat()
+
+
+def _paper_time(value):
+    return pd.Timestamp(value).tz_convert("UTC")
+
+
+def _paper_dict(row):
+    return dict(row) if row is not None else None
+
+
+def _paper_fetch(conn, trade_id):
+    return _paper_dict(_paper_exec(conn, "SELECT * FROM paper_trades WHERE id=?", (trade_id,)).fetchone())
+
+
+def _paper_now():
+    return pd.Timestamp.now(tz="UTC")
+
+
+def _paper_public_trade(row):
+    if row is None:
+        return None
+    result = dict(row)
+    result.pop("analysis_json", None)
+    result["outcome_mismatch"] = bool(
+        row.get("broker_outcome") and row.get("price_outcome")
+        and row["broker_outcome"] != row["price_outcome"]
+    )
+    return make_json_safe(result)
+
+
+@app.get("/api/paper/health", dependencies=[Depends(_paper_auth)])
+def paper_health():
+    _paper_initialize()
+    with _paper_db() as conn:
+        count = _paper_exec(conn, "SELECT COUNT(*) AS n FROM paper_trades").fetchone()["n"]
+    return {"status": "READY", "version": VERSION, "storage": PAPER_DB_TYPE,
+            "stored_trades": int(count), "automation": "EXTERNAL_SCHEDULER_REQUIRED",
+            "mode": "DEMO_ONLY"}
+
+
+@app.post("/api/paper/scan", dependencies=[Depends(_paper_auth)])
+def paper_scan(req: PaperScanRequest):
+    """Capture only a fresh, newly observed CALL/PUT. No automated order is sent."""
+    _paper_initialize()
+    pair = req.pair.strip().upper()
+    timeframe = req.timeframe.strip()
+    if pair not in ALLOWED_PAIRS:
+        raise HTTPException(status_code=400, detail="Unsupported Forex pair")
+    if timeframe not in ("1min", "5min"):
+        raise HTTPException(status_code=400, detail="Paper test supports 1min and 5min expiry")
+
+    # Reuse the existing signal endpoint calculation (unchanged trading strategy).
+    signal_data = get_signal(SignalRequest(pair=pair, timeframe=timeframe))
+    side = signal_data["signal"]
+    if side not in ("CALL", "PUT"):
+        return {"status": "WAIT", "stored": False, "pair": pair,
+                "reason": signal_data["reason"], "candle_time": signal_data["candle_time"],
+                "strategy_version": VERSION}
+
+    observed_at = _paper_now()
+    candle_open = _paper_time(signal_data["candle_time"])
+    available_at = candle_open + TIMEFRAMES["1min"]
+    age_seconds = float((observed_at - available_at).total_seconds())
+    if age_seconds < -1:
+        raise HTTPException(status_code=409, detail="Signal candle has not yet closed")
+    if age_seconds > PAPER_MAX_SIGNAL_AGE_SECONDS:
+        return {"status": "STALE_SKIPPED", "stored": False, "pair": pair,
+                "side": side, "age_seconds": round(age_seconds, 2),
+                "max_age_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS}
+
+    score = signal_data.get("score") or {}
+    trade_id = str(uuid.uuid4())
+    with _paper_db() as conn:
+        _paper_exec(conn, """
+            INSERT INTO paper_trades (
+                id,pair,side,expiry_timeframe,signal_candle_open_utc,
+                signal_available_at_utc,observed_at_utc,signal_age_seconds,
+                signal_close,signal_reason,score_call,score_put,
+                strategy_version,analysis_json,status,updated_at_utc
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT (pair, side, expiry_timeframe, signal_candle_open_utc) DO NOTHING
+        """, (
+            trade_id,pair,side,timeframe,_paper_iso(candle_open),
+            _paper_iso(available_at),_paper_iso(observed_at),round(age_seconds, 3),
+            float(signal_data["price"]),str(signal_data["reason"]),
+            int(score.get("CALL", 0)),int(score.get("PUT", 0)),
+            VERSION,__import__("json").dumps(make_json_safe(signal_data.get("analysis", {})), ensure_ascii=False),
+            "SIGNAL",_paper_iso(observed_at),
+        ))
+        row = _paper_exec(conn, """
+            SELECT * FROM paper_trades WHERE pair=? AND side=? AND expiry_timeframe=? AND signal_candle_open_utc=?
+        """, (pair,side,timeframe,_paper_iso(candle_open))).fetchone()
+        result = _paper_public_trade(_paper_dict(row))
+    return {"status": "CAPTURED" if result["id"] == trade_id else "ALREADY_CAPTURED",
+            "stored": True, "trade": result,
+            "note": "Observation only. Enter DEMO fill and exit manually. No real order is placed."}
+
+
+@app.post("/api/paper/trades/{trade_id}/entry", dependencies=[Depends(_paper_auth)])
+def paper_record_entry(trade_id: str, req: PaperEntryRequest):
+    """Attach actual observed broker DEMO entry (never reconstruct from M1 OHLC)."""
+    _paper_initialize()
+    entry_at = _paper_time(_paper_iso(req.entry_at_utc))
+    now = _paper_now()
+    if entry_at > now + pd.Timedelta(seconds=10):
+        raise HTTPException(status_code=422, detail="Entry timestamp cannot be in the future")
+    with _paper_db() as conn:
+        trade = _paper_fetch(conn, trade_id)
+        if trade is None:
+            raise HTTPException(status_code=404, detail="Paper signal not found")
+        if trade["status"] != "SIGNAL":
+            raise HTTPException(status_code=409, detail="Entry already recorded or signal voided")
+        available_at = _paper_time(trade["signal_available_at_utc"])
+        observed_at = _paper_time(trade["observed_at_utc"])
+        if entry_at < available_at or entry_at < observed_at - pd.Timedelta(seconds=5):
+            raise HTTPException(status_code=422, detail="Entry must be at/after live signal observation")
+        expiry_at = (
+            _paper_time(_paper_iso(req.expiry_at_utc))
+            if req.expiry_at_utc is not None
+            else entry_at + TIMEFRAMES[trade["expiry_timeframe"]]
+        )
+        if expiry_at <= entry_at:
+            raise HTTPException(status_code=422, detail="Expiry must be after entry")
+        if expiry_at - entry_at > pd.Timedelta(minutes=15):
+            raise HTTPException(status_code=422, detail="Expiry more than 15 minutes after entry is unsupported")
+        pip = _pip_size_for_pair(trade["pair"])
+        adverse_gap = (float(req.entry_price) - float(trade["signal_close"])) / pip
+        if trade["side"] == "PUT":
+            adverse_gap = -adverse_gap
+        cursor = _paper_exec(conn, """
+            UPDATE paper_trades SET
+                status='OPEN',entry_at_utc=?,entry_price=?,expiry_at_utc=?,
+                stake=?,payout_percent=?,broker=?,entry_adverse_gap_pips=?,
+                notes=?,updated_at_utc=?
+            WHERE id=? AND status='SIGNAL'
+        """, (_paper_iso(entry_at), float(req.entry_price), _paper_iso(expiry_at),
+              float(req.stake),float(req.payout_percent),req.broker.strip(),round(adverse_gap,5),
+              req.notes,_paper_iso(now),trade_id))
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=409, detail="Entry changed concurrently")
+        updated = _paper_fetch(conn, trade_id)
+    return {"status": "OPEN", "trade": _paper_public_trade(updated),
+            "disclaimer": "Manual DEMO fill; entry price is provided by the user, not Twelve Data."}
+
+
+@app.post("/api/paper/trades/{trade_id}/exit", dependencies=[Depends(_paper_auth)])
+def paper_record_exit(trade_id: str, req: PaperExitRequest):
+    _paper_initialize()
+    exit_at = _paper_time(_paper_iso(req.exit_at_utc))
+    if exit_at > _paper_now() + pd.Timedelta(seconds=10):
+        raise HTTPException(status_code=422, detail="Exit timestamp cannot be in the future")
+    if req.broker_outcome is not None and req.broker_outcome not in ("WIN","LOSS","DRAW"):
+        raise HTTPException(status_code=422, detail="broker_outcome must be WIN, LOSS or DRAW")
+    with _paper_db() as conn:
+        trade = _paper_fetch(conn, trade_id)
+        if trade is None:
+            raise HTTPException(status_code=404, detail="Paper signal not found")
+        if trade["status"] != "OPEN":
+            raise HTTPException(status_code=409, detail="Trade is not OPEN")
+        entry_at = _paper_time(trade["entry_at_utc"])
+        expiry_at = _paper_time(trade["expiry_at_utc"])
+        if exit_at <= entry_at:
+            raise HTTPException(status_code=422, detail="Exit must occur after entry")
+        # Real broker expiry may differ slightly. Keep discrepancy visible.
+        discrepancy_seconds = round(float((exit_at - expiry_at).total_seconds()),3)
+        price_outcome = _expiry_outcome(trade["side"], float(trade["entry_price"]), float(req.exit_price))
+        effective_outcome = req.broker_outcome or price_outcome
+        stake = float(trade["stake"])
+        payout = float(trade["payout_percent"])
+        profit = round((stake * payout / 100 if effective_outcome == "WIN"
+                        else -stake if effective_outcome == "LOSS" else 0.0), 6)
+        notes = (trade.get("notes") or "")
+        if req.notes:
+            notes = (notes + " | " + req.notes).strip(" |")[:1000]
+        cursor = _paper_exec(conn, """
+            UPDATE paper_trades SET
+                status='CLOSED',exit_at_utc=?,exit_price=?,price_outcome=?,
+                broker_outcome=?,effective_outcome=?,net_profit=?,notes=?,updated_at_utc=?
+            WHERE id=? AND status='OPEN'
+        """, (_paper_iso(exit_at),float(req.exit_price),price_outcome,req.broker_outcome,
+              effective_outcome,profit,notes,_paper_iso(_paper_now()),trade_id))
+        if cursor.rowcount != 1:
+            raise HTTPException(status_code=409, detail="Exit changed concurrently")
+        updated = _paper_fetch(conn, trade_id)
+    return {"status": "CLOSED", "trade": _paper_public_trade(updated),
+            "expiry_timestamp_error_seconds": discrepancy_seconds,
+            "expiry_timestamp_review_required": abs(discrepancy_seconds) > 5,
+            "broker_vs_price_outcome_mismatch": bool(req.broker_outcome and req.broker_outcome != price_outcome)}
+
+
+@app.post("/api/paper/trades/{trade_id}/void", dependencies=[Depends(_paper_auth)])
+def paper_void_trade(trade_id: str, req: PaperVoidRequest):
+    """Do not delete or rewrite an observation; retain a reasoned audit trail."""
+    _paper_initialize()
+    with _paper_db() as conn:
+        row = _paper_fetch(conn, trade_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Paper trade not found")
+        if row["status"] == "VOID":
+            raise HTTPException(status_code=409, detail="Already voided")
+        _paper_exec(conn, "UPDATE paper_trades SET status='VOID',void_reason=?,updated_at_utc=? WHERE id=? AND status!='VOID'",
+                    (req.reason,_paper_iso(_paper_now()),trade_id))
+    return {"status": "VOID", "id": trade_id, "reason": req.reason}
+
+
+@app.get("/api/paper/trades", dependencies=[Depends(_paper_auth)])
+def paper_list_trades(limit: int = Query(default=50, ge=1, le=500),
+                      offset: int = Query(default=0, ge=0),
+                      status: str | None = Query(default=None)):
+    _paper_initialize()
+    if status is not None and status not in ("SIGNAL","OPEN","CLOSED","VOID"):
+        raise HTTPException(status_code=422, detail="Invalid status filter")
+    with _paper_db() as conn:
+        if status:
+            total = _paper_exec(conn,"SELECT COUNT(*) AS n FROM paper_trades WHERE status=?",(status,)).fetchone()["n"]
+            rows = _paper_exec(conn,"SELECT * FROM paper_trades WHERE status=? ORDER BY observed_at_utc DESC LIMIT ? OFFSET ?",
+                               (status,limit,offset)).fetchall()
+        else:
+            total = _paper_exec(conn,"SELECT COUNT(*) AS n FROM paper_trades").fetchone()["n"]
+            rows = _paper_exec(conn,"SELECT * FROM paper_trades ORDER BY observed_at_utc DESC LIMIT ? OFFSET ?",
+                               (limit,offset)).fetchall()
+    return {"total":int(total),"returned":len(rows),"trades":[_paper_public_trade(_paper_dict(row)) for row in rows]}
+
+
+@app.get("/api/paper/trades/{trade_id}", dependencies=[Depends(_paper_auth)])
+def paper_get_trade(trade_id: str):
+    _paper_initialize()
+    with _paper_db() as conn:
+        row = _paper_fetch(conn,trade_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Paper trade not found")
+    return {"trade": _paper_public_trade(row)}
+
+
+@app.get("/api/paper/stats", dependencies=[Depends(_paper_auth)])
+def paper_stats():
+    _paper_initialize()
+    with _paper_db() as conn:
+        counts = _paper_exec(conn, "SELECT status, COUNT(*) AS n FROM paper_trades GROUP BY status").fetchall()
+        closed = [_paper_dict(row) for row in _paper_exec(conn,
+            "SELECT side,expiry_timeframe,effective_outcome,price_outcome,broker_outcome,net_profit,stake,entry_adverse_gap_pips FROM paper_trades WHERE status='CLOSED'").fetchall()]
+    c = {row["status"]:int(row["n"]) for row in counts}
+    wins = sum(x["effective_outcome"]=="WIN" for x in closed)
+    losses = sum(x["effective_outcome"]=="LOSS" for x in closed)
+    draws = sum(x["effective_outcome"]=="DRAW" for x in closed)
+    total_stakes = sum(float(x["stake"]) for x in closed)
+    net = sum(float(x["net_profit"]) for x in closed)
+    mismatch = sum(bool(x["broker_outcome"] and x["broker_outcome"]!=x["price_outcome"]) for x in closed)
+    per_side = {}
+    for side in ("CALL","PUT"):
+        group = [x for x in closed if x["side"]==side]
+        per_side[side] = {"count":len(group),"wins":sum(x["effective_outcome"]=="WIN" for x in group),
+                          "losses":sum(x["effective_outcome"]=="LOSS" for x in group),
+                          "net_profit":round(sum(float(x["net_profit"]) for x in group), 4)}
+    return {"version":VERSION,"mode":"MANUAL_DEMO_FORWARD_TEST","storage":PAPER_DB_TYPE,
+            "total":sum(c.values()),"by_status":c,"closed":len(closed),
+            "wins":wins,"losses":losses,"draws":draws,
+            "win_rate_excluding_draws_percent":round(wins/(wins+losses)*100,2) if wins+losses else None,
+            "total_stakes":round(total_stakes,4),"net_profit":round(net,4),
+            "return_on_stakes_percent":round(net/total_stakes*100,2) if total_stakes else None,
+            "broker_outcome_mismatches":mismatch,"by_direction":per_side,
+            "warning":"Forward DEMO observations only; no trades are executed by this API. Small samples have high uncertainty."}
+
+
+@app.get("/api/paper/export.csv", dependencies=[Depends(_paper_auth)])
+def paper_export_csv():
+    _paper_initialize()
+    with _paper_db() as conn:
+        rows = [_paper_public_trade(_paper_dict(row)) for row in _paper_exec(
+            conn,"SELECT * FROM paper_trades ORDER BY observed_at_utc ASC").fetchall()]
+    fields = ["id","pair","side","expiry_timeframe","signal_candle_open_utc",
+              "signal_available_at_utc","observed_at_utc","signal_age_seconds",
+              "signal_close","strategy_version","status","entry_at_utc","entry_price",
+              "expiry_at_utc","stake","payout_percent","broker","exit_at_utc",
+              "exit_price","price_outcome","broker_outcome","effective_outcome",
+              "net_profit","entry_adverse_gap_pips","outcome_mismatch","void_reason","notes"]
+    data = io.StringIO()
+    writer = csv.DictWriter(data, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        # Neutralize spreadsheet-formula injection if a CSV is opened in Excel.
+        safe_row = {k: ("'" + str(row.get(k)) if isinstance(row.get(k),str) and row.get(k).startswith(("=","+","-","@","\t","\r")) else row.get(k)) for k in fields}
+        writer.writerow(safe_row)
+    return Response(content="\ufeff"+data.getvalue(),media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition":"attachment; filename=smc_paper_trades.csv",
+                             "Cache-Control":"no-store"})
 
 
 # ==================================================
