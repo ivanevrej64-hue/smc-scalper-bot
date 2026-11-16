@@ -1,7 +1,8 @@
 import os
 import math
 import logging
-from datetime import timedelta
+from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo
 from collections import deque
 
 import numpy as np
@@ -20,7 +21,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.6"
+VERSION = "2.4.7"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -53,6 +54,8 @@ ANALYSIS_TIMEFRAMES = ["1h", "15min", "5min", "1min"]
 
 CANDLE_LIMIT = 150
 BACKTEST_CANDLE_LIMIT = 5000
+FX_MARKET_TIMEZONE = ZoneInfo("America/New_York")
+PAYOUT_RATES = (0.70, 0.80, 0.90)
 SWING_LENGTH = 5
 M15_MEMORY_BARS = 8  # Срок жизни подтвержденного BOS/CHoCH после свечи пробоя
 CANDLE_SAFETY_SECONDS = 3
@@ -111,6 +114,14 @@ class BacktestRequest(BaseModel):
     pair: str = Field(default="EUR/USD")
     timeframe: str = Field(default="1min")
     candles: int = Field(default=5000, ge=1000, le=5000)
+    # Влияет только на исторические проверки, не на /api/signal.
+    market_mode: str = Field(default="regular_forex")
+
+
+class BacktestCompareRequest(BaseModel):
+    pair: str = Field(default="EUR/USD")
+    weeks: int = Field(default=2, ge=1, le=3)
+    candles_per_week: int = Field(default=1500, ge=1000, le=3000)
 
 
 # ==================================================
@@ -120,7 +131,8 @@ class BacktestRequest(BaseModel):
 def get_market_data(
     pair: str,
     timeframe: str,
-    outputsize: int = CANDLE_LIMIT
+    outputsize: int = CANDLE_LIMIT,
+    end_date=None,
 ) -> pd.DataFrame:
 
     if not TWELVEDATA_KEY:
@@ -140,12 +152,23 @@ def get_market_data(
     try:
         td = TDClient(apikey=TWELVEDATA_KEY)
 
-        response = td.time_series(
-            symbol=pair,
-            interval=timeframe,
-            outputsize=outputsize,
-            timezone="UTC"
-        )
+        request_args = {
+            "symbol": pair,
+            "interval": timeframe,
+            "outputsize": outputsize,
+            "timezone": "UTC",
+        }
+        if end_date is not None:
+            bound = pd.Timestamp(end_date)
+            if bound.tzinfo is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="end_date должен содержать часовой пояс",
+                )
+            request_args["end_date"] = bound.tz_convert("UTC").strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        response = td.time_series(**request_args)
 
         df = response.as_pandas()
 
@@ -1621,6 +1644,131 @@ def get_virtual_trades(
 
 
 # ==================================================
+# NORMAL FOREX SESSION AND WEEKLY HISTORY
+# ==================================================
+
+def _regular_forex_candle_mask(df, timeframe):
+    """True only when the WHOLE candle is in the normal Forex session.
+
+    The usual convention is Sunday 17:00 to Friday 17:00 New York time.
+    The IANA timezone handles Eastern daylight saving automatically.
+    Source timestamps represent candle opens, not closes.
+    """
+    if df.empty:
+        return np.zeros(0, dtype=bool)
+    start_ny = df.index.tz_convert(FX_MARKET_TIMEZONE)
+    end_ny = (df.index + pd.Timedelta(TIMEFRAMES[timeframe])).tz_convert(
+        FX_MARKET_TIMEZONE
+    )
+    opening_minute = 17 * 60
+
+    def in_session(idx, is_close):
+        weekday = idx.dayofweek
+        minutes = idx.hour * 60 + idx.minute + idx.second / 60.0
+        friday_ok = (minutes <= opening_minute) if is_close else (minutes < opening_minute)
+        return (
+            (weekday >= 0) & (weekday <= 3)
+        ) | (
+            (weekday == 4) & friday_ok
+        ) | (
+            (weekday == 6) & (minutes >= opening_minute)
+        )
+
+    return np.asarray(in_session(start_ny, False) & in_session(end_ny, True), dtype=bool)
+
+
+def _regular_forex_filter(df, timeframe):
+    return df.loc[_regular_forex_candle_mask(df, timeframe)].copy()
+
+
+def _last_completed_friday_anchors(number_of_weeks, now=None):
+    """Fridays at 17:00 New York wall clock, latest fully completed first."""
+    now_ny = (datetime.now(FX_MARKET_TIMEZONE) if now is None else
+              pd.Timestamp(now).tz_convert(FX_MARKET_TIMEZONE).to_pydatetime())
+    friday_date = now_ny.date() - timedelta(days=(now_ny.weekday() - 4) % 7)
+    this_friday_end = datetime.combine(friday_date, time(17), FX_MARKET_TIMEZONE)
+    if this_friday_end > now_ny:
+        friday_date -= timedelta(days=7)
+    return [
+        pd.Timestamp(datetime.combine(
+            friday_date - timedelta(days=7 * i), time(17), FX_MARKET_TIMEZONE
+        ))
+        for i in range(number_of_weeks)
+    ]
+
+
+def _payout_analysis(wins, losses, draws):
+    closed = wins + losses + draws
+    decided = wins + losses
+    result = {}
+    for rate in PAYOUT_RATES:
+        net_units = wins * rate - losses
+        result[str(int(rate * 100))] = {
+            "payout_percent": int(rate * 100),
+            "net_units_per_1_unit_stake": round(net_units, 4),
+            "return_on_total_stakes_percent": (
+                round(net_units * 100 / closed, 2) if closed else None
+            ),
+            "break_even_win_rate_excluding_draws_percent": round(
+                100 / (1 + rate), 2
+            ),
+        }
+    return {
+        "payout_rates": result,
+        "win_rate_excluding_draws_percent": (
+            round(100 * wins / decided, 2) if decided else None
+        ),
+        "draw_policy": "RETURN_STAKE_ZERO_PROFIT",
+        "stake_unit": 1,
+        "closed_trades": int(closed),
+        "notes": (
+            "Модель бинарных опционов: WIN +ставка×выплата, LOSS -ставка, "
+            "DRAW возврат ставки. Не учитывает реальное исполнение брокера."
+        ),
+    }
+
+
+def _expiry_outcome(signal, entry_price, exit_price):
+    diff = exit_price - entry_price
+    if diff == 0:
+        return "DRAW"
+    if (signal == "CALL" and diff > 0) or (signal == "PUT" and diff < 0):
+        return "WIN"
+    return "LOSS"
+
+
+def _settle_signal_events_for_expiry(events, m1, expiry_timeframe):
+    """Compare expiries on the SAME entry signals and SAME M1 dataset."""
+    wins = losses = draws = unresolved = 0
+    for event in events:
+        expiry = event["entry_time"] + TIMEFRAMES[expiry_timeframe]
+        data = _m1_candle_at_expiry(m1, expiry)
+        if data is None:
+            unresolved += 1
+            continue
+        outcome = _expiry_outcome(
+            event["signal"], event["entry_price"], data["exit_price"]
+        )
+        if outcome == "WIN":
+            wins += 1
+        elif outcome == "LOSS":
+            losses += 1
+        else:
+            draws += 1
+    closed = wins + losses + draws
+    return {
+        "expiry_timeframe": expiry_timeframe,
+        "signals_generated": len(events),
+        "closed_trades": closed,
+        "unresolved_expiry_candles": unresolved,
+        "wins": wins,
+        "losses": losses,
+        "draws": draws,
+        "win_rate_percent": round(100 * wins / closed, 2) if closed else None,
+        "payout_analysis": _payout_analysis(wins, losses, draws),
+    }
+
+# ==================================================
 # HISTORICAL BACKTEST HELPERS
 # ==================================================
 
@@ -1699,12 +1847,29 @@ def _new_funnel_counts():
     }
 
 
-def run_historical_backtest(pair, expiry_timeframe, candle_count):
-    history = {
+def run_historical_backtest(
+    pair, expiry_timeframe, candle_count,
+    market_mode="regular_forex", history_override=None,
+    collect_signal_events=False,
+):
+    if market_mode not in ("regular_forex", "all_data"):
+        raise HTTPException(status_code=400, detail="Недопустимый market_mode")
+
+    raw_history = (history_override if history_override is not None else {
         tf: get_market_data(pair, tf, outputsize=candle_count)
         for tf in ANALYSIS_TIMEFRAMES
+    })
+    raw_counts = {tf: int(len(raw_history[tf])) for tf in ANALYSIS_TIMEFRAMES}
+    history = {
+        tf: (_regular_forex_filter(raw_history[tf], tf)
+             if market_mode == "regular_forex" else raw_history[tf].copy())
+        for tf in ANALYSIS_TIMEFRAMES
     }
-
+    if any(len(df) == 0 for df in history.values()):
+        raise HTTPException(status_code=422, detail="Нет свечей внутри выбранной торговой сессии")
+    excluded_counts = {
+        tf: raw_counts[tf] - len(history[tf]) for tf in ANALYSIS_TIMEFRAMES
+    }
     m1 = history["1min"]
 
     if len(m1) < 1000:
@@ -1722,6 +1887,7 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
     draws = 0
     unresolved_expiry = 0
     trades = []
+    signal_events = [] if collect_signal_events else None
 
     # These are *M1 evaluation observations*, not unique H1/M15/M5 events.
     evaluation_funnel = _new_funnel_counts()
@@ -1981,6 +2147,12 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
         entry_price = float(m1.iloc[i]["close"])
         entry_time = m1_open_time + TIMEFRAMES["1min"]
         expiry_at = entry_time + expiry_duration
+        if signal_events is not None:
+            signal_events.append({
+                "signal": result["signal"],
+                "entry_price": entry_price,
+                "entry_time": entry_time,
+            })
         # Exact expiration price: M1 candle opens at expiry - 1m and
         # closes at expiry. Missing candle means unresolved, never a guess.
         exit_data = _m1_candle_at_expiry(m1, expiry_at)
@@ -2079,10 +2251,20 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
         "sample_evaluations": audit_samples,
     }
 
-    return {
+    output = {
         "strategy_version": VERSION,
         "pair": pair,
         "expiry_timeframe": expiry_timeframe,
+        "market_mode": market_mode,
+        "session_filter": {
+            "timezone": "America/New_York",
+            "hours": "Sunday 17:00 through Friday 17:00 ET",
+            "whole_candle_must_fit_session": True,
+            "raw_candles": raw_counts,
+            "excluded_candles": {k: int(v) for k, v in excluded_counts.items()},
+            "retained_candles": {tf: int(len(history[tf])) for tf in ANALYSIS_TIMEFRAMES},
+        },
+        "payout_analysis": _payout_analysis(wins, losses, draws),
         "requested_m1_candles": candle_count,
         "available_candles": {tf: int(len(history[tf])) for tf in ANALYSIS_TIMEFRAMES},
         "evaluated_points": evaluated,
@@ -2145,6 +2327,9 @@ def run_historical_backtest(pair, expiry_timeframe, candle_count):
             "backtest_data_audit проверяет временную целостность и разнообразие результатов; предупреждения требуют проверки входных свечей."
         ]
     }
+    if signal_events is not None:
+        output["_signal_events_for_comparison"] = signal_events
+    return output
 
 
 # ==================================================
@@ -2171,10 +2356,142 @@ def historical_backtest(req: BacktestRequest):
     result = run_historical_backtest(
         pair=pair,
         expiry_timeframe=expiry_timeframe,
-        candle_count=req.candles
+        candle_count=req.candles,
+        market_mode=req.market_mode,
     )
 
     return make_json_safe(result)
+
+
+@app.post("/api/backtest/compare")
+def compare_expiry_across_weeks(req: BacktestCompareRequest):
+    """Compare 1m and 5m settlement from identical signals in separate weeks.
+
+    One Twelve Data request per TF per week. Historical windows are anchored
+    at the LAST fully completed Friday 17:00 ET and at previous Fridays.
+    The window uses up to candles_per_week M1 source candles: it is a SAMPLE,
+    not necessarily a complete trading week.
+    """
+    pair = req.pair.strip().upper()
+    if pair not in ALLOWED_PAIRS:
+        raise HTTPException(status_code=400, detail="Эта валютная пара не поддерживается")
+
+    weekly = []
+    failures = []
+    total = {expiry: {"signals_generated": 0, "closed_trades": 0,
+                      "unresolved_expiry_candles": 0,
+                      "wins": 0, "losses": 0, "draws": 0}
+             for expiry in ("1min", "5min")}
+
+    for week_end in _last_completed_friday_anchors(req.weeks):
+        try:
+            input_history = {
+                tf: get_market_data(
+                    pair, tf, outputsize=req.candles_per_week,
+                    end_date=week_end.tz_convert("UTC"),
+                )
+                for tf in ANALYSIS_TIMEFRAMES
+            }
+            report = run_historical_backtest(
+                pair=pair,
+                expiry_timeframe="1min",
+                candle_count=req.candles_per_week,
+                market_mode="regular_forex",
+                history_override=input_history,
+                collect_signal_events=True,
+            )
+            events = report.pop("_signal_events_for_comparison")
+            clean_m1 = _regular_forex_filter(input_history["1min"], "1min")
+
+            one_min = {
+                "expiry_timeframe": "1min",
+                "signals_generated": report["signals_generated"],
+                "closed_trades": report["closed_trades"],
+                "unresolved_expiry_candles": report["unresolved_expiry_candles"],
+                "wins": report["wins"], "losses": report["losses"],
+                "draws": report["draws"],
+                "win_rate_percent": report["win_rate_percent"],
+                "payout_analysis": report["payout_analysis"],
+            }
+            five_min = _settle_signal_events_for_expiry(
+                events, clean_m1, "5min"
+            )
+            for expiry, result in (("1min", one_min), ("5min", five_min)):
+                for metric in total[expiry]:
+                    total[expiry][metric] += int(result[metric])
+
+            weekly.append({
+                "week_end_new_york": week_end.isoformat(),
+                "week_end_utc": week_end.tz_convert("UTC").isoformat(),
+                "evaluated_points": report["evaluated_points"],
+                "skipped_points_insufficient_history": report[
+                    "skipped_points_insufficient_history"
+                ],
+                "session_filter": report["session_filter"],
+                "data_audit": {
+                    "status": report["backtest_data_audit"]["status"],
+                    "warnings": report["backtest_data_audit"]["warnings"],
+                    "future_candle_violations": report["backtest_data_audit"][
+                        "future_candle_violations"
+                    ],
+                    "m1_window_alignment_violations": report["backtest_data_audit"][
+                        "m1_window_alignment_violations"
+                    ],
+                },
+                "expiry_results": {"1min": one_min, "5min": five_min},
+            })
+        except HTTPException as exc:
+            if isinstance(exc.detail, dict) and exc.detail.get("error") == "BACKTEST_LOOKAHEAD_BLOCKED":
+                # A chronology violation invalidates the entire comparison.
+                raise
+            failures.append({
+                "week_end_new_york": week_end.isoformat(),
+                "error": make_json_safe(exc.detail),
+                "status_code": exc.status_code,
+            })
+
+    if not weekly:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "NO_VALID_WEEKS", "failures": failures,
+                    "hint": "Проверьте лимит Twelve Data и доступность истории"},
+        )
+
+    overall = {}
+    for expiry, stats in total.items():
+        wins, losses, draws = stats["wins"], stats["losses"], stats["draws"]
+        overall[expiry] = {
+            **stats,
+            "win_rate_percent": (
+                round(100 * wins / stats["closed_trades"], 2)
+                if stats["closed_trades"] else None
+            ),
+            "payout_analysis": _payout_analysis(wins, losses, draws),
+        }
+
+    return make_json_safe({
+        "strategy_version": VERSION,
+        "pair": pair,
+        "market_mode": "regular_forex",
+        "requested_weeks": req.weeks,
+        "completed_weeks": len(weekly),
+        "partial": bool(failures),
+        "candles_per_week_requested": req.candles_per_week,
+        "week_sampling": "Отдельные исторические окна перед пятничным закрытием; не вся неделя",
+        "rates_percent": [70, 80, 90],
+        "weeks": weekly,
+        "failures": failures,
+        "overall": overall,
+        "limitations": [
+            "До четырёх запросов Twelve Data на неделю; тариф и доступная история могут ограничивать результат.",
+            "Свечи внутри обычной сессии Forex (America/New_York), не котировки OTC.",
+            "Выборка ограничена candles_per_week свечами M1 на неделю; это не полные пять торговых дней.",
+            "Обе экспирации проверены на ОДНИХ сигналах и одной M1 истории для каждого окна.",
+            "Свечи выходных отбрасываются до расчётов индикаторов; результат не совместим с OTC котировками брокера.",
+            "Не учитываются спред, задержки исполнения и реальные выплаты; ничья означает возврат ставки.",
+            "Исторические сигналы соседних M1 свечей зависимы, выборка может быть малой.",
+        ],
+    })
 
 
 # ==================================================
@@ -2196,7 +2513,9 @@ def api_health():
         "status": "online",
         "version": VERSION,
         "twelvedata_key_configured": bool(TWELVEDATA_KEY),
-        "backtest_slice_engine": "pandas_datetime_searchsorted_v2"
+        "backtest_slice_engine": "pandas_datetime_searchsorted_v2",
+        "regular_forex_sessions": True,
+        "weekly_expiry_comparison": True,
     }
 
 
