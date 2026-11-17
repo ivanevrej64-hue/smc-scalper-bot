@@ -4,7 +4,7 @@ on:
   # Pilot: every 10 minutes on weekdays, 07:00–18:59 UTC.
   # GitHub schedule is approximate, and may be delayed or skipped.
   schedule:
-    - cron: '7,17,27,37,47,57 7-18 * * 1-5'
+    - cron: '8,18,28,38,48,58 7-18 * * 1-5'
   workflow_dispatch:
 
 permissions:
