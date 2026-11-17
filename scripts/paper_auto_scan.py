@@ -62,7 +62,21 @@ def run_scan(now_utc=None, post_json=None) -> dict:
     status = response.get("status")
     if status not in ALLOWED_RESPONSES:
         raise RuntimeError("API scan returned an unexpected status; see server logs")
-    result = {"status": status, "pair": response.get("pair", payload["pair"]), "stored": bool(response.get("stored", False))}
+    # For WAIT, stored=False is expected: no trade exists. We need a separate
+    # DB receipt to know the SCAN itself was persisted. Version 2.4.14 provides it.
+    scan_log_id = response.get("scan_log_id")
+    if response.get("scan_logged") is not True or not isinstance(scan_log_id, str) or len(scan_log_id) < 16:
+        raise RuntimeError(
+            "API did not confirm scan log persistence. Deploy server.py 2.4.14 first, "
+            "then retry; check Render logs if the server returns HTTP 503."
+        )
+    result = {
+        "status": status,
+        "pair": response.get("pair", payload["pair"]),
+        "stored": bool(response.get("stored", False)),
+        "scan_logged": True,
+        "scan_log_id": scan_log_id,
+    }
     if status in ("CAPTURED", "ALREADY_CAPTURED"):
         trade = response.get("trade") or {}
         result.update({"signal": trade.get("side"), "candle_time": trade.get("signal_candle_open_utc")})
