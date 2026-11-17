@@ -21,7 +21,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.13"
+VERSION = "2.4.14"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -3566,6 +3566,7 @@ def api_health():
         "paper_mode": "DEMO_ONLY",
         "paper_capture_requires_authenticated_scan": True,
         "paper_scan_monitoring": True,
+        "paper_scan_receipt_required": True,
     }
 
 
@@ -3798,28 +3799,49 @@ def _paper_public_trade(row):
 
 
 def _paper_record_scan_result(pair: str, timeframe: str, result: dict, candle_time=None, reason=""):
-    """Persist observed scans, including WAIT. Never insert synthetic trades.
+    """Persist every authenticated scan and return an independently verified DB receipt.
 
-    Scan logging must not cause a confirmed paper opportunity to be lost if
-    the scan-log insert itself encounters a transient database issue.
+    IMPORTANT: Successful HTTP 200 with WAIT used to be returned even when the
+    scan-log insert failed. In 2.4.14, logging failures must surface as HTTP 503,
+    so GitHub Actions cannot report a false successful scan.
+
+    For a confirmed CALL/PUT, the paper opportunity may already have committed
+    before this log is written; clients may retry, as trade insertion is deduped.
     """
+    status = str(result.get("status", "UNKNOWN"))
+    trade = result.get("trade") or {}
+    scan_id = str(uuid.uuid4())
     try:
-        status = str(result.get("status", "UNKNOWN"))
-        trade = result.get("trade") or {}
         with _paper_db() as conn:
-            _paper_exec(conn, """
+            cursor = _paper_exec(conn, """
                 INSERT INTO paper_scan_runs (
                     id, pair, expiry_timeframe, scanned_at_utc, result_status,
                     signal_candle_open_utc, trade_id, reason, strategy_version
                 ) VALUES (?,?,?,?,?,?,?,?,?)
             """, (
-                str(uuid.uuid4()), pair, timeframe, _paper_iso(_paper_now()),
+                scan_id, pair, timeframe, _paper_iso(_paper_now()),
                 status, str(candle_time) if candle_time is not None else None,
                 trade.get("id"), str(reason or result.get("reason") or "")[:500], VERSION,
             ))
-    except Exception:
-        logger.exception("Paper scan was processed but monitoring log could not be saved")
-    return result
+            if cursor.rowcount != 1:
+                raise RuntimeError("Scan log insert affected no rows")
+
+        # A second connection confirms that the committed row is readable by
+        # the same backend used by GET /api/paper/monitor.
+        with _paper_db() as conn:
+            receipt = _paper_exec(
+                conn,
+                "SELECT id FROM paper_scan_runs WHERE id=?", (scan_id,),
+            ).fetchone()
+        if receipt is None:
+            raise RuntimeError("Committed scan log receipt is not readable")
+    except Exception as exc:
+        logger.exception("Paper scan logging FAILED: no durable receipt for scan_id=%s", scan_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Paper scan result could not be verified in storage; inspect Render server logs",
+        ) from exc
+    return {**result, "scan_logged": True, "scan_log_id": scan_id}
 
 
 @app.get("/api/paper/monitor", dependencies=[Depends(_paper_auth)])
