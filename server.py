@@ -21,7 +21,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.15"
+VERSION = "2.4.16"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -59,6 +59,9 @@ PAYOUT_RATES = (0.70, 0.80, 0.90)
 SWING_LENGTH = 5
 M15_MEMORY_BARS = 8  # Срок жизни подтвержденного BOS/CHoCH после свечи пробоя
 CANDLE_SAFETY_SECONDS = 3
+# A 1-minute paper signal observed >30 seconds after candle close is too late
+# to model a practical entry. This is a safety limit, NOT an optimisation of the strategy.
+PAPER_MAX_SIGNAL_AGE_SECONDS = 30
 
 MIN_SCORE = 70
 MIN_M5_SCORE_EDGE = 10
@@ -143,6 +146,7 @@ def get_market_data(
     timeframe: str,
     outputsize: int = CANDLE_LIMIT,
     end_date=None,
+    as_of_utc=None,
 ) -> pd.DataFrame:
 
     if not TWELVEDATA_KEY:
@@ -230,11 +234,13 @@ def get_market_data(
         )
         df = df[valid_ohlc]
 
-        cutoff = (
-            pd.Timestamp.now(tz="UTC")
-            - TIMEFRAMES[timeframe]
-            - timedelta(seconds=CANDLE_SAFETY_SECONDS)
-        )
+        # One shared observation clock for H1/M15/M5/M1. A live request must
+        # never include a candle which was unfinished at analysis start.
+        as_of = pd.Timestamp.now(tz="UTC") if as_of_utc is None else pd.Timestamp(as_of_utc)
+        if pd.isna(as_of) or as_of.tzinfo is None:
+            raise HTTPException(status_code=400, detail="as_of_utc must be timezone-aware")
+        as_of = as_of.tz_convert("UTC")
+        cutoff = as_of - TIMEFRAMES[timeframe] - timedelta(seconds=CANDLE_SAFETY_SECONDS)
 
         df = df[df.index <= cutoff]
 
@@ -1461,45 +1467,13 @@ def settle_virtual_trades(pair, m1_df):
         logger.info("Virtual trade settled: %s %s", pair, outcome)
 
 
-def create_virtual_trade(
-    pair,
-    signal,
-    candle_time,
-    entry_price,
-    timeframe
-):
-    if signal not in ("CALL", "PUT"):
-        return None
+def create_virtual_trade(pair, signal, candle_time, entry_price, timeframe):
+    """Deprecated 2.4.16: never invent a past execution at candle close.
 
-    trade_id = f"{pair}_{candle_time}_{timeframe}"
-
-    for trade in VIRTUAL_TRADES:
-        if trade["id"] == trade_id:
-            return trade
-
-    # Сигнал формируется после закрытия M1 свечи.
-    # Поэтому фактическое время входа — время открытия свечи + 1 минута.
-    signal_candle_open = pd.Timestamp(candle_time)
-    entry_time = signal_candle_open + TIMEFRAMES["1min"]
-    expiry_at = entry_time + TIMEFRAMES[timeframe]
-
-    trade = {
-        "id": trade_id,
-        "pair": pair,
-        "signal": signal,
-        "timeframe": timeframe,
-        "entry_price": float(entry_price),
-        "entry_time": entry_time.isoformat(),
-        "expiry_at": expiry_at.isoformat(),
-        "status": "OPEN",
-        "outcome": None,
-        "exit_price": None,
-        "exit_time": None,
-        "price_change": None
-    }
-
-    VIRTUAL_TRADES.append(trade)
-    return trade
+    Keep the signature for compatibility with older integrations; no fills
+    or outcomes may be created without an observed DEMO broker entry.
+    """
+    return None
 
 
 # ==================================================
@@ -1524,6 +1498,56 @@ def save_signal_history(pair, result, candle_time, price, requested_timeframe):
 
 
 # ==================================================
+# LIVE DATA FRESHNESS (NO LOOK-AHEAD, NO RETROSPECTIVE EXECUTIONS)
+# ==================================================
+
+def _live_data_freshness(market_data, analysis_at_utc, observed_at_utc):
+    """How old were the last fully closed candles when the analysis was observed?
+
+    Uses the actual END of each candle, not its Twelve Data opening timestamp.
+    H1/M15/M5 are contextual; only M1 freshness gates a 1-minute signal.
+    No price or fill is reconstructed from a past candle after the fact.
+    """
+    analysis_at = pd.Timestamp(analysis_at_utc).tz_convert("UTC")
+    observed_at = pd.Timestamp(observed_at_utc).tz_convert("UTC")
+    candles = {}
+    for tf in ANALYSIS_TIMEFRAMES:
+        last_open = pd.Timestamp(market_data[tf].index[-1]).tz_convert("UTC")
+        last_close = last_open + TIMEFRAMES[tf]
+        candles[tf] = {
+            "last_candle_open_utc": last_open.isoformat(),
+            "last_candle_close_utc": last_close.isoformat(),
+            "age_seconds": round(float((observed_at - last_close).total_seconds()), 3),
+        }
+
+    m1_close = pd.Timestamp(candles["1min"]["last_candle_close_utc"])
+    age_seconds = float((observed_at - m1_close).total_seconds())
+    if age_seconds < 0:
+        status = "NOT_CLOSED"
+        reason = "M1 candle has not closed at observation time"
+    elif age_seconds > PAPER_MAX_SIGNAL_AGE_SECONDS:
+        status = "STALE"
+        reason = (
+            f"M1 signal candle is {age_seconds:.1f}s old; "
+            f"maximum {PAPER_MAX_SIGNAL_AGE_SECONDS}s"
+        )
+    else:
+        status = "FRESH"
+        reason = "M1 candle is recently closed"
+
+    return {
+        "status": status,
+        "reason": reason,
+        "analysis_at_utc": analysis_at.isoformat(),
+        "observed_at_utc": observed_at.isoformat(),
+        "signal_available_at_utc": m1_close.isoformat(),
+        "signal_age_seconds": round(age_seconds, 3),
+        "max_signal_age_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS,
+        "candles": candles,
+    }
+
+
+# ==================================================
 # API: SIGNAL
 # ==================================================
 
@@ -1544,14 +1568,24 @@ def get_signal(req: SignalRequest):
             detail="Недопустимый таймфрейм"
         )
 
+    # All four downloads share the same snapshot cutoff even if Twelve Data
+    # requests cross a minute/5-minute boundary while they are in flight.
+    analysis_at_utc = pd.Timestamp.now(tz="UTC")
     market_data = {
-        tf: get_market_data(pair, tf)
+        tf: get_market_data(pair, tf, as_of_utc=analysis_at_utc)
         for tf in ANALYSIS_TIMEFRAMES
     }
 
-    settle_virtual_trades(pair, market_data["1min"])
-
     result = analyze_multi_timeframe(market_data)
+    observed_at_utc = pd.Timestamp.now(tz="UTC")
+    freshness = _live_data_freshness(market_data, analysis_at_utc, observed_at_utc)
+    raw_signal = result["signal"]
+    raw_reason = result["reason"]
+    if freshness["status"] != "FRESH":
+        # Diagnostics and scores are preserved but an old signal must never
+        # be presented as an executable, newly observed CALL or PUT.
+        result["signal"] = "WAIT"
+        result["reason"] = "Ожидание: данные M1 устарели или свеча ещё не закрылась"
 
     last_m1 = market_data["1min"].iloc[-1]
     candle_time = market_data["1min"].index[-1].isoformat()
@@ -1565,13 +1599,10 @@ def get_signal(req: SignalRequest):
         requested_timeframe
     )
 
-    virtual_trade = create_virtual_trade(
-        pair=pair,
-        signal=result["signal"],
-        candle_time=candle_time,
-        entry_price=price,
-        timeframe=requested_timeframe
-    )
+    # Do NOT create backdated virtual fills at the prior candle's close.
+    # The authenticated paper workflow records an observed signal; the user
+    # must record an actual DEMO fill and exit separately to assess outcomes.
+    virtual_trade = None
 
     response = {
         "signal": result["signal"],
@@ -1591,7 +1622,11 @@ def get_signal(req: SignalRequest):
         "alignment": result["alignment"],
         "analysis": result["analysis"],
         "decision_diagnostics": result["decision_diagnostics"],
-        "virtual_trade": virtual_trade
+        "virtual_trade": virtual_trade,
+        "virtual_trade_note": "No retrospective entry/fill from historical candle close; use authenticated paper trade entry for DEMO fills.",
+        "raw_signal_before_freshness_gate": raw_signal,
+        "raw_reason_before_freshness_gate": raw_reason,
+        "freshness": freshness,
     }
 
     return make_json_safe(response)
@@ -3567,14 +3602,18 @@ def api_health():
         "paper_capture_requires_authenticated_scan": True,
         "paper_scan_monitoring": True,
         "paper_scan_receipt_required": True,
+        "live_candle_snapshot_clock": "shared_analysis_timestamp_v1",
+        "m1_paper_freshness_guard_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS,
+        "stale_scan_audit": True,
+        "retrospective_virtual_fills_disabled": True,
     }
 
 
 # ==================================================
-# v2.4.13 — FORWARD PAPER TEST + EXTERNAL SCAN MONITORING
+# v2.4.16 — FORWARD PAPER TEST + FRESHNESS AUDIT
 # ==================================================
-# This extension intentionally does NOT change SMC signal calculations,
-# historical backtest logic, or the existing public /api/signal endpoint.
+# This extension does not change SMC signal calculations or backtest rules.
+# The public /api/signal response now includes freshness and blocks stale signals.
 # It records *observed forward* opportunities only when an authenticated
 # client explicitly invokes POST /api/paper/scan.
 
@@ -3592,7 +3631,6 @@ from fastapi.responses import Response
 PAPER_API_KEY = os.getenv("PAPER_API_KEY", "")
 PAPER_DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PAPER_SQLITE_PATH = os.getenv("PAPER_SQLITE_PATH", "").strip()
-PAPER_MAX_SIGNAL_AGE_SECONDS = 90
 PAPER_DB_TYPE = "postgres" if PAPER_DATABASE_URL else ("sqlite" if PAPER_SQLITE_PATH else "disabled")
 _PAPER_DB_READY = False
 _PAPER_DB_LOCK = threading.Lock()
@@ -3645,7 +3683,13 @@ CREATE TABLE IF NOT EXISTS paper_scan_runs (
     signal_candle_open_utc TEXT,
     trade_id TEXT,
     reason TEXT NOT NULL,
-    strategy_version TEXT NOT NULL
+    strategy_version TEXT NOT NULL,
+    analysis_at_utc TEXT,
+    signal_available_at_utc TEXT,
+    signal_age_seconds DOUBLE PRECISION,
+    freshness_status TEXT,
+    freshness_reason TEXT,
+    last_candles_json TEXT
 )
 """
 
@@ -3758,6 +3802,24 @@ def _paper_initialize():
             _paper_exec(conn, PAPER_DDL)
             _paper_exec(conn, "CREATE INDEX IF NOT EXISTS paper_status_idx ON paper_trades(status, observed_at_utc)")
             _paper_exec(conn, PAPER_SCAN_DDL)
+            # Existing 2.4.15 databases already have this table: migrate in
+            # place without dropping scans or paper trades (SQLite + Postgres).
+            extra_columns = (
+                ("analysis_at_utc", "TEXT"),
+                ("signal_available_at_utc", "TEXT"),
+                ("signal_age_seconds", "DOUBLE PRECISION"),
+                ("freshness_status", "TEXT"),
+                ("freshness_reason", "TEXT"),
+                ("last_candles_json", "TEXT"),
+            )
+            if PAPER_DB_TYPE == "postgres":
+                for column_name, column_type in extra_columns:
+                    _paper_exec(conn, f"ALTER TABLE paper_scan_runs ADD COLUMN IF NOT EXISTS {column_name} {column_type}")
+            else:
+                existing = {row["name"] for row in _paper_exec(conn, "PRAGMA table_info(paper_scan_runs)").fetchall()}
+                for column_name, column_type in extra_columns:
+                    if column_name not in existing:
+                        _paper_exec(conn, f"ALTER TABLE paper_scan_runs ADD COLUMN {column_name} {column_type}")
             _paper_exec(conn, "CREATE INDEX IF NOT EXISTS paper_runs_time_idx ON paper_scan_runs(scanned_at_utc)")
         _PAPER_DB_READY = True
 
@@ -3798,7 +3860,7 @@ def _paper_public_trade(row):
     return make_json_safe(result)
 
 
-def _paper_record_scan_result(pair: str, timeframe: str, result: dict, candle_time=None, reason=""):
+def _paper_record_scan_result(pair: str, timeframe: str, result: dict, candle_time=None, reason="", timing=None):
     """Persist every authenticated scan and return an independently verified DB receipt.
 
     IMPORTANT: Successful HTTP 200 with WAIT used to be returned even when the
@@ -3810,18 +3872,25 @@ def _paper_record_scan_result(pair: str, timeframe: str, result: dict, candle_ti
     """
     status = str(result.get("status", "UNKNOWN"))
     trade = result.get("trade") or {}
+    timing = timing or {}
     scan_id = str(uuid.uuid4())
     try:
         with _paper_db() as conn:
             cursor = _paper_exec(conn, """
                 INSERT INTO paper_scan_runs (
                     id, pair, expiry_timeframe, scanned_at_utc, result_status,
-                    signal_candle_open_utc, trade_id, reason, strategy_version
-                ) VALUES (?,?,?,?,?,?,?,?,?)
+                    signal_candle_open_utc, trade_id, reason, strategy_version,
+                    analysis_at_utc, signal_available_at_utc, signal_age_seconds,
+                    freshness_status, freshness_reason, last_candles_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 scan_id, pair, timeframe, _paper_iso(_paper_now()),
                 status, str(candle_time) if candle_time is not None else None,
                 trade.get("id"), str(reason or result.get("reason") or "")[:500], VERSION,
+                timing.get("analysis_at_utc"), timing.get("signal_available_at_utc"),
+                timing.get("signal_age_seconds"), timing.get("status"),
+                str(timing.get("reason") or "")[:500],
+                __import__("json").dumps(timing.get("candles", {}), ensure_ascii=False),
             ))
             if cursor.rowcount != 1:
                 raise RuntimeError("Scan log insert affected no rows")
@@ -3841,7 +3910,14 @@ def _paper_record_scan_result(pair: str, timeframe: str, result: dict, candle_ti
             status_code=503,
             detail="Paper scan result could not be verified in storage; inspect Render server logs",
         ) from exc
-    return {**result, "scan_logged": True, "scan_log_id": scan_id}
+    return {
+        **result,
+        "scan_logged": True,
+        "scan_log_id": scan_id,
+        "signal_age_seconds": timing.get("signal_age_seconds"),
+        "data_freshness_status": timing.get("status"),
+        "max_signal_age_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS,
+    }
 
 
 @app.get("/api/paper/monitor", dependencies=[Depends(_paper_auth)])
@@ -3852,7 +3928,9 @@ def paper_monitor(limit: int = Query(default=12, ge=1, le=50)):
     with _paper_db() as conn:
         recent = _paper_exec(conn, """
             SELECT id, pair, expiry_timeframe, scanned_at_utc, result_status,
-                   signal_candle_open_utc, trade_id, reason, strategy_version
+                   signal_candle_open_utc, trade_id, reason, strategy_version,
+                   analysis_at_utc, signal_available_at_utc, signal_age_seconds,
+                   freshness_status, freshness_reason
             FROM paper_scan_runs ORDER BY scanned_at_utc DESC LIMIT ?
         """, (limit,)).fetchall()
         counts = _paper_exec(conn, """
@@ -3871,7 +3949,8 @@ def paper_monitor(limit: int = Query(default=12, ge=1, le=50)):
         "scans_last_24_hours": int(sum(row["n"] for row in counts)),
         "status_counts_last_24_hours": {row["result_status"]: int(row["n"]) for row in counts},
         "recent_scans": runs,
-        "note": "Shows authenticated scan calls, whether automatic or manual. No broker execution.",
+        "max_signal_age_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS,
+        "note": "Shows authenticated scan calls, whether automatic or manual. No broker execution. Old records have null freshness metadata.",
     }
 
 
@@ -3887,7 +3966,7 @@ def paper_health():
 
 @app.post("/api/paper/scan", dependencies=[Depends(_paper_auth)])
 def paper_scan(req: PaperScanRequest):
-    """Capture only a fresh, newly observed CALL/PUT. No automated order is sent."""
+    """DEMO observation only. Persist both fresh WAIT and stale scan diagnostics."""
     _paper_initialize()
     pair = req.pair.strip().upper()
     timeframe = req.timeframe.strip()
@@ -3896,29 +3975,41 @@ def paper_scan(req: PaperScanRequest):
     if timeframe not in ("1min", "5min"):
         raise HTTPException(status_code=400, detail="Paper test supports 1min and 5min expiry")
 
-    # Reuse the existing signal endpoint calculation (unchanged trading strategy).
     signal_data = get_signal(SignalRequest(pair=pair, timeframe=timeframe))
+    timing = dict(signal_data["freshness"])
+    candle_open = _paper_time(signal_data["candle_time"])
+    available_at = candle_open + TIMEFRAMES["1min"]
+    observed_at = _paper_now()  # repeat the safety check after get_signal returns
+    age_seconds = float((observed_at - available_at).total_seconds())
+    timing["signal_age_seconds"] = round(age_seconds, 3)
+    timing["observed_at_utc"] = _paper_iso(observed_at)
+
+    # This also applies to WAIT scans; otherwise the monitor hides stale data.
+    if age_seconds < 0 or age_seconds > PAPER_MAX_SIGNAL_AGE_SECONDS or timing["status"] != "FRESH":
+        timing["status"] = "STALE" if age_seconds >= 0 else "NOT_CLOSED"
+        timing["reason"] = (
+            f"M1 candle age {age_seconds:.1f}s (limit {PAPER_MAX_SIGNAL_AGE_SECONDS}s)"
+            if age_seconds >= 0 else "M1 candle not closed at observation time"
+        )
+        return _paper_record_scan_result(pair, timeframe, {
+            "status": "STALE_SKIPPED", "stored": False, "pair": pair,
+            "reason": timing["reason"],
+            "candle_time": signal_data["candle_time"],
+            "raw_signal": signal_data["raw_signal_before_freshness_gate"],
+            "strategy_version": VERSION,
+        }, candle_time=signal_data["candle_time"], reason=timing["reason"], timing=timing)
+
     side = signal_data["signal"]
     if side not in ("CALL", "PUT"):
         return _paper_record_scan_result(pair, timeframe, {
             "status": "WAIT", "stored": False, "pair": pair,
-            "reason": signal_data["reason"], "candle_time": signal_data["candle_time"],
+            "reason": signal_data["reason"],
+            "candle_time": signal_data["candle_time"],
             "strategy_version": VERSION,
-        }, candle_time=signal_data["candle_time"], reason=signal_data["reason"])
+        }, candle_time=signal_data["candle_time"], reason=signal_data["reason"], timing=timing)
 
-    observed_at = _paper_now()
-    candle_open = _paper_time(signal_data["candle_time"])
-    available_at = candle_open + TIMEFRAMES["1min"]
-    age_seconds = float((observed_at - available_at).total_seconds())
-    if age_seconds < -1:
-        raise HTTPException(status_code=409, detail="Signal candle has not yet closed")
-    if age_seconds > PAPER_MAX_SIGNAL_AGE_SECONDS:
-        return _paper_record_scan_result(pair, timeframe, {
-            "status": "STALE_SKIPPED", "stored": False, "pair": pair,
-            "side": side, "age_seconds": round(age_seconds, 2),
-            "max_age_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS,
-        }, candle_time=signal_data["candle_time"], reason="Signal too old")
-
+    # Store only the observed SIGNAL; never infer a fill from the old candle close.
+    # A real DEMO entry/exit must be recorded via the manual paper-trade APIs.
     score = signal_data.get("score") or {}
     trade_id = str(uuid.uuid4())
     with _paper_db() as conn:
@@ -3931,22 +4022,22 @@ def paper_scan(req: PaperScanRequest):
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (pair, side, expiry_timeframe, signal_candle_open_utc) DO NOTHING
         """, (
-            trade_id,pair,side,timeframe,_paper_iso(candle_open),
-            _paper_iso(available_at),_paper_iso(observed_at),round(age_seconds, 3),
-            float(signal_data["price"]),str(signal_data["reason"]),
-            int(score.get("CALL", 0)),int(score.get("PUT", 0)),
-            VERSION,__import__("json").dumps(make_json_safe(signal_data.get("analysis", {})), ensure_ascii=False),
-            "SIGNAL",_paper_iso(observed_at),
+            trade_id, pair, side, timeframe, _paper_iso(candle_open),
+            _paper_iso(available_at), _paper_iso(observed_at), round(age_seconds, 3),
+            float(signal_data["price"]), str(signal_data["reason"]),
+            int(score.get("CALL", 0)), int(score.get("PUT", 0)),
+            VERSION, __import__("json").dumps(make_json_safe(signal_data.get("analysis", {})), ensure_ascii=False),
+            "SIGNAL", _paper_iso(observed_at),
         ))
         row = _paper_exec(conn, """
             SELECT * FROM paper_trades WHERE pair=? AND side=? AND expiry_timeframe=? AND signal_candle_open_utc=?
-        """, (pair,side,timeframe,_paper_iso(candle_open))).fetchone()
+        """, (pair, side, timeframe, _paper_iso(candle_open))).fetchone()
         result = _paper_public_trade(_paper_dict(row))
     return _paper_record_scan_result(pair, timeframe, {
         "status": "CAPTURED" if result["id"] == trade_id else "ALREADY_CAPTURED",
         "stored": True, "trade": result,
-        "note": "Observation only. Enter DEMO fill and exit manually. No real order is placed.",
-    }, candle_time=signal_data["candle_time"], reason=signal_data["reason"])
+        "note": "Signal observation only. DEMO fill and exit must be recorded separately; no broker execution.",
+    }, candle_time=signal_data["candle_time"], reason=signal_data["reason"], timing=timing)
 
 
 @app.post("/api/paper/trades/{trade_id}/entry", dependencies=[Depends(_paper_auth)])
@@ -3965,7 +4056,7 @@ def paper_record_entry(trade_id: str, req: PaperEntryRequest):
             raise HTTPException(status_code=409, detail="Entry already recorded or signal voided")
         available_at = _paper_time(trade["signal_available_at_utc"])
         observed_at = _paper_time(trade["observed_at_utc"])
-        if entry_at < available_at or entry_at < observed_at - pd.Timedelta(seconds=5):
+        if entry_at < available_at or entry_at < observed_at:
             raise HTTPException(status_code=422, detail="Entry must be at/after live signal observation")
         expiry_at = (
             _paper_time(_paper_iso(req.expiry_at_utc))
