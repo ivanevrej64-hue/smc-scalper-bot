@@ -21,7 +21,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.16"
+VERSION = "2.4.17"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -62,6 +62,13 @@ CANDLE_SAFETY_SECONDS = 3
 # A 1-minute paper signal observed >30 seconds after candle close is too late
 # to model a practical entry. This is a safety limit, NOT an optimisation of the strategy.
 PAPER_MAX_SIGNAL_AGE_SECONDS = 30
+# Conservative, bounded refresh of a missing closed M1 bar. The external
+# cron-job.org request has a 30-second timeout: at most 2 more M1 calls, never
+# extend the 30-second signal freshness window, and reserve time for analysis.
+M1_RETRY_ENABLED = os.getenv("M1_RETRY_ENABLED", "true").lower() in ("1", "true", "yes")
+M1_RETRY_MAX_ATTEMPTS = 2
+M1_RETRY_WAIT_SECONDS = 5.0
+M1_RETRY_SAFETY_MARGIN_SECONDS = 3.0
 
 MIN_SCORE = 70
 MIN_M5_SCORE_EDGE = 10
@@ -182,9 +189,11 @@ def get_market_data(
             request_args["end_date"] = bound.tz_convert("UTC").strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
+        provider_request_started_at = pd.Timestamp.now(tz="UTC")
         response = td.time_series(**request_args)
 
         df = response.as_pandas()
+        provider_response_received_at = pd.Timestamp.now(tz="UTC")
 
         if df is None or df.empty:
             raise HTTPException(
@@ -211,6 +220,9 @@ def get_market_data(
         df = df.sort_index()
         df = df[~df.index.isna()]
         df = df[~df.index.duplicated(keep="last")]
+        if df.empty:
+            raise HTTPException(status_code=502, detail=f"No valid source timestamps: {pair} {timeframe}")
+        raw_provider_times = df.index.copy()  # Before OHLC validation.
 
         required = ["open", "high", "low", "close"]
 
@@ -233,6 +245,8 @@ def get_market_data(
             (df["low"] <= df["close"])
         )
         df = df[valid_ohlc]
+        if df.empty:
+            raise HTTPException(status_code=502, detail=f"No valid source OHLC: {pair} {timeframe}")
 
         # One shared observation clock for H1/M15/M5/M1. A live request must
         # never include a candle which was unfinished at analysis start.
@@ -241,6 +255,15 @@ def get_market_data(
             raise HTTPException(status_code=400, detail="as_of_utc must be timezone-aware")
         as_of = as_of.tz_convert("UTC")
         cutoff = as_of - TIMEFRAMES[timeframe] - timedelta(seconds=CANDLE_SAFETY_SECONDS)
+        expected_open = cutoff.floor(pd.Timedelta(TIMEFRAMES[timeframe]))
+        raw_latest_open = pd.Timestamp(raw_provider_times[-1])
+        raw_has_expected = bool(expected_open in raw_provider_times)
+        valid_has_expected = bool(expected_open in df.index)
+        # Classify *the actual provider response* before the no-look-ahead filter.
+        # This distinguishes a delayed/missing bar from an accidental rejection
+        # of a bar which had already arrived. No secret/API key is included.
+        raw_lag_seconds = float((expected_open - raw_latest_open).total_seconds())
+        raw_incomplete = bool(raw_latest_open + TIMEFRAMES[timeframe] > as_of)
 
         df = df[df.index <= cutoff]
 
@@ -253,7 +276,36 @@ def get_market_data(
                 )
             )
 
-        return df.tail(outputsize)
+        latest_usable_open = pd.Timestamp(df.index[-1])
+        if raw_has_expected and not valid_has_expected:
+            diagnosis = "EXPECTED_BAR_REJECTED_INVALID_OHLC"
+        elif raw_has_expected and latest_usable_open < expected_open:
+            diagnosis = "FILTER_REJECTED_AVAILABLE_EXPECTED_BAR"
+        elif not raw_has_expected and raw_latest_open < expected_open:
+            diagnosis = "PROVIDER_HAS_NOT_RETURNED_EXPECTED_BAR"
+        elif not raw_has_expected:
+            diagnosis = "EXPECTED_BAR_MISSING_IN_PROVIDER_SERIES"
+        else:
+            diagnosis = "EXPECTED_CLOSED_BAR_AVAILABLE"
+        diagnostics = {
+            "provider": "Twelve Data",
+            "interval": timeframe,
+            "request_started_at_utc": provider_request_started_at.isoformat(),
+            "response_received_at_utc": provider_response_received_at.isoformat(),
+            "analysis_cutoff_utc": as_of.isoformat(),
+            "expected_latest_closed_open_utc": expected_open.isoformat(),
+            "raw_latest_open_utc": raw_latest_open.isoformat(),
+            "raw_latest_may_be_open_candle": raw_incomplete,
+            "raw_has_expected_closed_bar": raw_has_expected,
+            "expected_bar_passed_ohlc_validation": valid_has_expected,
+            "raw_latest_minus_expected_seconds": round(-raw_lag_seconds, 3),
+            "filtered_latest_open_utc": latest_usable_open.isoformat(),
+            "filtered_out_newer_raw_bar": bool(raw_latest_open > latest_usable_open),
+            "diagnosis": diagnosis,
+        }
+        result = df.tail(outputsize)
+        result.attrs["live_provider_diagnostics"] = diagnostics
+        return result
 
     except HTTPException:
         raise
@@ -1548,6 +1600,83 @@ def _live_data_freshness(market_data, analysis_at_utc, observed_at_utc):
 
 
 # ==================================================
+# BOUNDED M1 BAR REFRESH (ONLY WHILE A FRESH SIGNAL IS STILL POSSIBLE)
+# ==================================================
+
+def _refresh_missing_m1_bar(pair, market_data, analysis_at_utc):
+    """Retry only the missing closed M1 bar; never reuse unfinished candles.
+
+    The shared analysis cutoff stays fixed. A refresh only supplies a candle
+    which had already closed at the start of the initial four-timeframe scan.
+    Requests are capped to fit the existing 30s cron-job.org HTTP timeout.
+    """
+    import time as _time
+
+    initial = market_data["1min"]
+    initial_open = pd.Timestamp(initial.index[-1])
+    as_of = pd.Timestamp(analysis_at_utc).tz_convert("UTC")
+    cutoff = as_of - TIMEFRAMES["1min"] - timedelta(seconds=CANDLE_SAFETY_SECONDS)
+    expected_open = cutoff.floor("min")
+    expected_close = expected_open + TIMEFRAMES["1min"]
+    # Leave a few seconds to evaluate MTF, persist the scan and respond.
+    deadline = expected_close + timedelta(
+        seconds=PAPER_MAX_SIGNAL_AGE_SECONDS - M1_RETRY_SAFETY_MARGIN_SECONDS
+    )
+    meta = {
+        "enabled": bool(M1_RETRY_ENABLED),
+        "initial_latest_closed_open_utc": initial_open.isoformat(),
+        "expected_latest_closed_open_utc": expected_open.isoformat(),
+        "attempts": 0,
+        "history": [],
+        "updated": False,
+        "stop_reason": None,
+    }
+    if initial_open >= expected_open:
+        meta["stop_reason"] = "ALREADY_LATEST_CLOSED_BAR"
+        return meta
+    if not M1_RETRY_ENABLED:
+        meta["stop_reason"] = "RETRY_DISABLED"
+        return meta
+
+    for i in range(M1_RETRY_MAX_ATTEMPTS):
+        seconds_left = (deadline - pd.Timestamp.now(tz="UTC")).total_seconds()
+        # Avoid an expensive call once it cannot complete before expiry.
+        if seconds_left < M1_RETRY_WAIT_SECONDS + 1.0:
+            meta["stop_reason"] = "FRESHNESS_DEADLINE_NEAR"
+            break
+        _time.sleep(M1_RETRY_WAIT_SECONDS)
+        try:
+            candidate = get_market_data(pair, "1min", as_of_utc=as_of)
+        except HTTPException as exc:
+            # A transient provider failure on a retry must never erase the
+            # already valid initial snapshot or create a false signal.
+            meta["history"].append({
+                "attempt": i + 1,
+                "result": "RETRY_FAILED",
+                "http_status": exc.status_code,
+            })
+            continue
+        candidate_open = pd.Timestamp(candidate.index[-1])
+        provider_diag = candidate.attrs.get("live_provider_diagnostics", {})
+        meta["attempts"] += 1
+        meta["history"].append({
+            "attempt": i + 1,
+            "latest_closed_open_utc": candidate_open.isoformat(),
+            "provider_raw_latest_open_utc": provider_diag.get("raw_latest_open_utc"),
+            "provider_diagnosis": provider_diag.get("diagnosis"),
+        })
+        if candidate_open > pd.Timestamp(market_data["1min"].index[-1]):
+            market_data["1min"] = candidate
+            meta["updated"] = True
+        if candidate_open >= expected_open:
+            meta["stop_reason"] = "EXPECTED_BAR_RECOVERED"
+            break
+    if meta["stop_reason"] is None:
+        meta["stop_reason"] = "RETRIES_EXHAUSTED"
+    return meta
+
+
+# ==================================================
 # API: SIGNAL
 # ==================================================
 
@@ -1575,10 +1704,19 @@ def get_signal(req: SignalRequest):
         tf: get_market_data(pair, tf, as_of_utc=analysis_at_utc)
         for tf in ANALYSIS_TIMEFRAMES
     }
+    retry_audit = _refresh_missing_m1_bar(pair, market_data, analysis_at_utc)
 
     result = analyze_multi_timeframe(market_data)
     observed_at_utc = pd.Timestamp.now(tz="UTC")
     freshness = _live_data_freshness(market_data, analysis_at_utc, observed_at_utc)
+    # The raw source bar and the filtered closed bar are both reported.
+    # With no creds in output, this is safe for Swagger and scan monitoring.
+    for tf in ANALYSIS_TIMEFRAMES:
+        diagnostics = market_data[tf].attrs.get("live_provider_diagnostics")
+        if diagnostics:
+            freshness["candles"][tf]["provider_diagnostics"] = diagnostics
+    freshness["m1_refresh"] = retry_audit
+    freshness.setdefault("candles", {}).setdefault("1min", {})["m1_refresh"] = retry_audit
     raw_signal = result["signal"]
     raw_reason = result["reason"]
     if freshness["status"] != "FRESH":
@@ -3604,6 +3742,9 @@ def api_health():
         "paper_scan_receipt_required": True,
         "live_candle_snapshot_clock": "shared_analysis_timestamp_v1",
         "m1_paper_freshness_guard_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS,
+        "m1_source_timing_audit": True,
+        "m1_missing_closed_bar_bounded_retry": bool(M1_RETRY_ENABLED),
+        "m1_max_refresh_attempts": M1_RETRY_MAX_ATTEMPTS,
         "stale_scan_audit": True,
         "retrospective_virtual_fills_disabled": True,
     }
@@ -3930,7 +4071,7 @@ def paper_monitor(limit: int = Query(default=12, ge=1, le=50)):
             SELECT id, pair, expiry_timeframe, scanned_at_utc, result_status,
                    signal_candle_open_utc, trade_id, reason, strategy_version,
                    analysis_at_utc, signal_available_at_utc, signal_age_seconds,
-                   freshness_status, freshness_reason
+                   freshness_status, freshness_reason, last_candles_json
             FROM paper_scan_runs ORDER BY scanned_at_utc DESC LIMIT ?
         """, (limit,)).fetchall()
         counts = _paper_exec(conn, """
@@ -3938,7 +4079,19 @@ def paper_monitor(limit: int = Query(default=12, ge=1, le=50)):
             WHERE scanned_at_utc >= ? GROUP BY result_status
         """, (cutoff,)).fetchall()
         total = _paper_exec(conn, "SELECT COUNT(*) AS n FROM paper_scan_runs").fetchone()["n"]
-    runs = [_paper_dict(row) for row in recent]
+    runs = []
+    for row in recent:
+        item = _paper_dict(row)
+        payload = item.pop("last_candles_json", None)
+        try:
+            candles = __import__("json").loads(payload or "{}")
+            m1 = candles.get("1min") or {}
+            item["m1_provider_diagnostics"] = m1.get("provider_diagnostics")
+            item["m1_refresh"] = m1.get("m1_refresh")
+        except (ValueError, TypeError, AttributeError):
+            item["m1_provider_diagnostics"] = None
+            item["m1_refresh"] = None
+        runs.append(item)
     return {
         "version": VERSION,
         "mode": "DEMO_ONLY",
