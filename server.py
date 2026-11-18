@@ -21,7 +21,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.14"
+VERSION = "2.4.15"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -1361,7 +1361,7 @@ def analyze_multi_timeframe(data, include_m5_diagnostics=True):
             "M15": m15["signal"],
             "M5": m5["signal"],
             "M1": m1["signal"],
-            "all_timeframes_aligned": len(set(directions)) == 1
+            "all_timeframes_aligned": len(set(directions)) == 1 and directions[0] in ("CALL", "PUT")
         },
         "analysis": components,
         "decision_diagnostics": {
