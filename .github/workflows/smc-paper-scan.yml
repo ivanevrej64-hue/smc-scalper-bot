@@ -1,6 +1,8 @@
 name: SMC Forward Paper Scan (DEMO only)
 
 on:
+  schedule:
+    - cron: '7,17,27,37,47,57 7-18 * * 1-5'
   workflow_dispatch:
 
 permissions:
