@@ -22,7 +22,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.18"
+VERSION = "2.4.19"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -52,6 +52,9 @@ TIMEFRAMES = {
 }
 
 ANALYSIS_TIMEFRAMES = ["1h", "15min", "5min", "1min"]
+# Fetch M1 first in LIVE scans; scoring order and historical backtest stay untouched.
+# The same shared cutoff remains in force for all four downloads.
+LIVE_FETCH_TIMEFRAMES = ["1min", "1h", "15min", "5min"]
 
 CANDLE_LIMIT = 150
 BACKTEST_CANDLE_LIMIT = 5000
@@ -1814,6 +1817,223 @@ def _refresh_missing_m1_bar(pair, market_data, analysis_at_utc):
 
 
 # ==================================================
+# v2.4.19 — READ-ONLY LIVE DIAGNOSTICS; STRATEGY UNCHANGED
+# ==================================================
+
+def _live_fetch_pipeline_diagnostics(analysis_at, observed_at, data,
+                                    initial_m1_diag, final_m1_diag, retry_audit):
+    """Report timestamps without re-requesting any candle or adding credits."""
+    analysis_at = pd.Timestamp(analysis_at).tz_convert("UTC")
+    observed_at = pd.Timestamp(observed_at).tz_convert("UTC")
+    per_tf = {}
+    for tf in LIVE_FETCH_TIMEFRAMES:
+        diag = data[tf].attrs.get("live_provider_diagnostics") or {}
+        request_at = diag.get("request_started_at_utc")
+        response_at = diag.get("response_received_at_utc")
+        duration_ms = None
+        if request_at and response_at:
+            duration_ms = round(float((pd.Timestamp(response_at) - pd.Timestamp(request_at)).total_seconds() * 1000), 1)
+        per_tf[tf] = {
+            "last_closed_open_utc": pd.Timestamp(data[tf].index[-1]).isoformat(),
+            "request_started_at_utc": request_at,
+            "response_received_at_utc": response_at,
+            "provider_elapsed_ms": duration_ms,
+            "provider_diagnosis": diag.get("diagnosis"),
+        }
+    return {
+        "fetch_order": list(LIVE_FETCH_TIMEFRAMES),
+        "m1_priority": True,
+        "shared_analysis_at_utc": analysis_at.isoformat(),
+        "observed_at_utc": observed_at.isoformat(),
+        "pipeline_elapsed_ms": round(float((observed_at - analysis_at).total_seconds() * 1000), 1),
+        "m1_initial_provider_diagnostics": initial_m1_diag,
+        "m1_final_provider_diagnostics": final_m1_diag,
+        "m1_refresh_attempts": int(retry_audit.get("attempts", 0)),
+        "m1_refresh_stop_reason": retry_audit.get("stop_reason"),
+        "per_timeframe": per_tf,
+        "note": "Provider timing is measured at Render, not exchange or broker execution time.",
+    }
+
+
+def _live_decision_audit(signal_data):
+    """A compact interpretation of the original raw multi-timeframe decision.
+
+    This is read-only. It MUST NOT modify the score, direction or freshness gate.
+    """
+    analysis = signal_data.get("analysis") or {}
+    alignment = signal_data.get("alignment") or {}
+    score = signal_data.get("score") or {}
+    raw = signal_data.get("raw_signal_before_freshness_gate", signal_data.get("signal", "WAIT"))
+    by_tf = {}
+    for tf in ("H1", "M15", "M5", "M1"):
+        component = analysis.get(tf) or {}
+        by_tf[tf] = {"signal": str(component.get("signal", alignment.get(tf, "UNKNOWN"))),
+                     "reason": component.get("reason")}
+    wait_timeframes = [tf for tf, item in by_tf.items() if item["signal"] == "WAIT"]
+    signals = [item["signal"] for item in by_tf.values()]
+    if raw in ("CALL", "PUT"):
+        primary = "SETUP_CONFIRMED"
+    elif wait_timeframes:
+        primary = wait_timeframes[0]
+    elif len(set(signals)) > 1:
+        primary = "DIRECTION_CONFLICT"
+    else:
+        primary = "INSUFFICIENT_SCORE"
+    h1 = analysis.get("H1") or {}
+    m15 = analysis.get("M15") or {}
+    m5 = analysis.get("M5") or {}
+    m1 = analysis.get("M1") or {}
+    m5diag = m5.get("diagnostics") or {}
+    return make_json_safe({
+        "raw_signal": raw,
+        "raw_reason": signal_data.get("raw_reason_before_freshness_gate", signal_data.get("reason")),
+        "primary_blocker": primary,
+        "wait_timeframes": wait_timeframes,
+        "per_timeframe": by_tf,
+        "score": {"CALL": score.get("CALL"), "PUT": score.get("PUT"),
+                  "minimum_required": score.get("minimum_required", MIN_SCORE)},
+        "h1": {"block_reason": h1.get("block_reason"),
+               "close": h1.get("h1_close"), "ema20": h1.get("ema20"), "ema50": h1.get("ema50"),
+               "close_minus_ema20": h1.get("close_minus_ema20"),
+               "ema20_minus_ema50": h1.get("ema20_minus_ema50")},
+        "m15": {"reason_code": m15.get("diagnostic_reason_code"),
+                "memory_status": m15.get("memory_status"),
+                "market_structure": m15.get("market_structure"),
+                "event_age_bars": m15.get("event_age_bars")},
+        "m5": {"sweep_bullish": (m5.get("liquidity_sweep") or {}).get("bullish"),
+               "sweep_bearish": (m5.get("liquidity_sweep") or {}).get("bearish"),
+               "fvg_reason": (m5diag.get("fvg") or {}).get("reason"),
+               "ob_reason": (m5diag.get("order_block") or {}).get("reason")},
+        "m1": {"breakout_call": m1.get("breakout_call"),
+               "breakout_put": m1.get("breakout_put"),
+               "failed_checks": m1.get("failed_checks", [])},
+    })
+
+
+def _paper_scan_diagnostic_payload(timing):
+    """Keep the existing DB schema; append a versioned namespace to JSON."""
+    payload = dict((timing or {}).get("candles") or {})
+    if (timing or {}).get("decision_audit") is not None:
+        payload["_v2419_decision_audit"] = timing["decision_audit"]
+    if (timing or {}).get("live_pipeline") is not None:
+        payload["_v2419_live_pipeline"] = timing["live_pipeline"]
+    return payload
+
+
+def _paper_parse_diagnostic_payload(payload):
+    import json
+    try:
+        data = json.loads(payload or "{}")
+        return data if isinstance(data, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _paper_diagnostic_summary(rows, hours, truncated=False):
+    """Summarise persisted scans, excluding legacy rows from blocker statistics.
+
+    H1/M15/etc blocker distributions use only FRESH analyzed scans so stale
+    market snapshots do not get mistaken for executable missed setups.
+    """
+    from collections import Counter
+    status_counts, primary, tf_wait, h1_reasons, m15_codes, m5_reasons = (Counter() for _ in range(6))
+    m1_signals, raw_signals, provider_diagnoses, refresh_results = (Counter() for _ in range(4))
+    m5_fvg_reasons, m5_ob_reasons, m1_failed_checks = (Counter() for _ in range(3))
+    fresh_ages, stale_ages = [], []
+    analyzed, legacy, fresh_analyzed, stale_analyzed = 0, 0, 0, 0
+    for row in rows:
+        row = dict(row)
+        status_counts[str(row.get("result_status") or "UNKNOWN")] += 1
+        payload = _paper_parse_diagnostic_payload(row.get("last_candles_json"))
+        decision = payload.get("_v2419_decision_audit")
+        m1 = payload.get("1min") or {}
+        pdiag = m1.get("provider_diagnostics") or {}
+        refresh = m1.get("m1_refresh") or {}
+        if isinstance(pdiag, dict) and pdiag.get("diagnosis"):
+            provider_diagnoses[str(pdiag["diagnosis"])] += 1
+        if isinstance(refresh, dict) and refresh.get("stop_reason"):
+            refresh_results[str(refresh["stop_reason"])] += 1
+        if not isinstance(decision, dict):
+            legacy += 1
+            continue
+        analyzed += 1
+        fresh = row.get("freshness_status") == "FRESH"
+        age = row.get("signal_age_seconds")
+        if not fresh:
+            stale_analyzed += 1
+            if isinstance(age, (float, int)):
+                stale_ages.append(float(age))
+            continue
+        fresh_analyzed += 1
+        if isinstance(age, (float, int)):
+            fresh_ages.append(float(age))
+        primary[str(decision.get("primary_blocker") or "UNKNOWN")] += 1
+        raw_signals[str(decision.get("raw_signal") or "UNKNOWN")] += 1
+        for tf in decision.get("wait_timeframes") or []:
+            if tf in ("H1", "M15", "M5", "M1"):
+                tf_wait[tf] += 1
+        h1 = decision.get("h1") or {}
+        if (decision.get("per_timeframe") or {}).get("H1", {}).get("signal") == "WAIT":
+            h1_reasons[str(h1.get("block_reason") or "UNKNOWN")] += 1
+        m15 = decision.get("m15") or {}
+        if (decision.get("per_timeframe") or {}).get("M15", {}).get("signal") == "WAIT":
+            m15_codes[str(m15.get("reason_code") or "UNKNOWN")] += 1
+        m5 = decision.get("m5") or {}
+        if (decision.get("per_timeframe") or {}).get("M5", {}).get("signal") == "WAIT":
+            m5_reasons[str((decision.get("per_timeframe") or {}).get("M5", {}).get("reason") or "UNKNOWN")] += 1
+            if m5.get("fvg_reason"):
+                m5_fvg_reasons[str(m5["fvg_reason"])] += 1
+            if m5.get("ob_reason"):
+                m5_ob_reasons[str(m5["ob_reason"])] += 1
+        m1 = decision.get("m1") or {}
+        if (decision.get("per_timeframe") or {}).get("M1", {}).get("signal") == "WAIT":
+            for reason_code in m1.get("failed_checks") or []:
+                m1_failed_checks[str(reason_code)] += 1
+        m1_signals[str((decision.get("per_timeframe") or {}).get("M1", {}).get("signal") or "UNKNOWN")] += 1
+    mean = lambda ages: round(sum(ages) / len(ages), 2) if ages else None
+    return {
+        "window_hours": hours,
+        "scans_examined": len(rows),
+        "truncated_to_safety_limit": bool(truncated),
+        "status_counts": dict(status_counts),
+        "diagnostic_profiles_available": analyzed,
+        "legacy_or_unanalyzed_scans": legacy,
+        "fresh_analyzed_scans": fresh_analyzed,
+        "stale_analyzed_scans": stale_analyzed,
+        "fresh_percentage_of_analyzed": round(100 * fresh_analyzed / analyzed, 1) if analyzed else None,
+        "fresh_m1_avg_age_seconds": mean(fresh_ages),
+        "stale_m1_avg_age_seconds": mean(stale_ages),
+        "primary_blockers_fresh_only": dict(primary),
+        "wait_timeframes_fresh_only": dict(tf_wait),
+        "h1_wait_reasons_fresh_only": dict(h1_reasons),
+        "m15_wait_reason_codes_fresh_only": dict(m15_codes),
+        "m5_wait_reasons_fresh_only": dict(m5_reasons),
+        "m5_fvg_reasons_fresh_only": dict(m5_fvg_reasons),
+        "m5_order_block_reasons_fresh_only": dict(m5_ob_reasons),
+        "m1_failed_checks_fresh_only": dict(m1_failed_checks),
+        "m1_signals_fresh_only": dict(m1_signals),
+        "raw_signals_fresh_only": dict(raw_signals),
+        "provider_m1_diagnoses_all_recent_scans": dict(provider_diagnoses),
+        "m1_refresh_stop_reasons_all_recent_scans": dict(refresh_results),
+        "interpretation": "Blocker stats count fresh analyzed scans only; one scan may have multiple WAIT timeframes. Historical rows without v2.4.19 metadata are excluded. No brokerage or profitability claim.",
+    }
+
+
+def _paper_query_diagnostic_summary(hours=24):
+    _paper_initialize()
+    cutoff = _paper_iso(_paper_now() - pd.Timedelta(hours=hours))
+    cap = 5000
+    with _paper_db() as conn:
+        rows = _paper_exec(conn, """
+            SELECT result_status, strategy_version, signal_age_seconds,
+                   freshness_status, last_candles_json
+            FROM paper_scan_runs WHERE scanned_at_utc >= ?
+            ORDER BY scanned_at_utc DESC LIMIT ?
+        """, (cutoff, cap+1)).fetchall()
+    return _paper_diagnostic_summary(rows[:cap], hours, truncated=len(rows)>cap)
+
+
+# ==================================================
 # API: SIGNAL
 # ==================================================
 
@@ -1852,10 +2072,16 @@ def _get_signal_core(req: SignalRequest):
     # All four downloads share the same snapshot cutoff even if Twelve Data
     # requests cross a minute/5-minute boundary while they are in flight.
     analysis_at_utc = pd.Timestamp.now(tz="UTC")
+    # M1 is the only timeframe with a 30-second freshness deadline. Request it
+    # before H1/M15/M5; the latter retain their original scoring semantics.
+    # Do not refresh another as-of timestamp: this preserves candle safety.
     market_data = {
         tf: get_market_data(pair, tf, as_of_utc=analysis_at_utc)
-        for tf in ANALYSIS_TIMEFRAMES
+        for tf in LIVE_FETCH_TIMEFRAMES
     }
+    initial_m1_diagnostics = dict(
+        market_data["1min"].attrs.get("live_provider_diagnostics") or {}
+    )
     retry_audit = _refresh_missing_m1_bar(pair, market_data, analysis_at_utc)
     if retry_audit.get("stop_reason") == "API_RATE_LIMITED":
         raise _td_budget_error(
@@ -1877,6 +2103,13 @@ def _get_signal_core(req: SignalRequest):
             freshness["candles"][tf]["provider_diagnostics"] = diagnostics
     freshness["m1_refresh"] = retry_audit
     freshness.setdefault("candles", {}).setdefault("1min", {})["m1_refresh"] = retry_audit
+    final_m1_diagnostics = (
+        market_data["1min"].attrs.get("live_provider_diagnostics") or {}
+    )
+    live_pipeline = _live_fetch_pipeline_diagnostics(
+        analysis_at_utc, observed_at_utc, market_data,
+        initial_m1_diagnostics, final_m1_diagnostics, retry_audit,
+    )
     raw_signal = result["signal"]
     raw_reason = result["reason"]
     if freshness["status"] != "FRESH":
@@ -1925,6 +2158,7 @@ def _get_signal_core(req: SignalRequest):
         "raw_signal_before_freshness_gate": raw_signal,
         "raw_reason_before_freshness_gate": raw_reason,
         "freshness": freshness,
+        "live_pipeline": live_pipeline,
     }
 
     return make_json_safe(response)
@@ -3905,6 +4139,9 @@ def api_health():
         "m1_source_timing_audit": True,
         "m1_missing_closed_bar_bounded_retry": bool(M1_RETRY_ENABLED),
         "m1_max_refresh_attempts": M1_RETRY_MAX_ATTEMPTS,
+        "m1_live_fetch_priority": True,
+        "paper_decision_audit_persisted": True,
+        "paper_diagnostics_report": True,
         "td_credit_guard_enabled": True,
         "td_local_minute_budget": TD_LOCAL_MINUTE_BUDGET,
         "td_provider_minute_limit": TD_PROVIDER_MINUTE_CREDITS,
@@ -4197,7 +4434,7 @@ def _paper_record_scan_result(pair: str, timeframe: str, result: dict, candle_ti
                 timing.get("analysis_at_utc"), timing.get("signal_available_at_utc"),
                 timing.get("signal_age_seconds"), timing.get("status"),
                 str(timing.get("reason") or "")[:500],
-                __import__("json").dumps(timing.get("candles", {}), ensure_ascii=False),
+                __import__("json").dumps(_paper_scan_diagnostic_payload(timing), ensure_ascii=False),
             ))
             if cursor.rowcount != 1:
                 raise RuntimeError("Scan log insert affected no rows")
@@ -4254,9 +4491,13 @@ def paper_monitor(limit: int = Query(default=12, ge=1, le=50)):
             m1 = candles.get("1min") or {}
             item["m1_provider_diagnostics"] = m1.get("provider_diagnostics")
             item["m1_refresh"] = m1.get("m1_refresh")
+            item["decision_audit"] = candles.get("_v2419_decision_audit")
+            item["live_pipeline"] = candles.get("_v2419_live_pipeline")
         except (ValueError, TypeError, AttributeError):
             item["m1_provider_diagnostics"] = None
             item["m1_refresh"] = None
+            item["decision_audit"] = None
+            item["live_pipeline"] = None
         runs.append(item)
     return {
         "version": VERSION,
@@ -4270,8 +4511,20 @@ def paper_monitor(limit: int = Query(default=12, ge=1, le=50)):
         "recent_scans": runs,
         "max_signal_age_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS,
         "twelvedata_budget": _td_quota_snapshot(),
+        "diagnostics_last_24_hours": _paper_query_diagnostic_summary(hours=24),
         "note": "Shows authenticated scan calls, whether automatic or manual. Local API counters do not include other applications or worker processes. No broker execution.",
     }
+
+
+@app.get("/api/paper/diagnostics", dependencies=[Depends(_paper_auth)])
+def paper_diagnostics(hours: int = Query(default=24, ge=1, le=168)):
+    """Persistent, read-only root-cause counters; no Twelve Data calls."""
+    return make_json_safe({
+        "version": VERSION,
+        "mode": "DEMO_ONLY",
+        "statistics": _paper_query_diagnostic_summary(hours=hours),
+        "twelvedata_budget": _td_quota_snapshot(),
+    })
 
 
 @app.get("/api/paper/health", dependencies=[Depends(_paper_auth)])
@@ -4316,6 +4569,10 @@ def paper_scan(req: PaperScanRequest):
             }, reason=reason, timing=rejected_timing)
         raise
     timing = dict(signal_data["freshness"])
+    # Capture raw decision even if paper execution later marks M1 stale.
+    # Never count stale snapshots as actionable signals in summary.
+    timing["decision_audit"] = _live_decision_audit(signal_data)
+    timing["live_pipeline"] = signal_data.get("live_pipeline")
     candle_open = _paper_time(signal_data["candle_time"])
     available_at = candle_open + TIMEFRAMES["1min"]
     observed_at = _paper_now()  # repeat the safety check after get_signal returns
