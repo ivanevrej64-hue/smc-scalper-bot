@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
 from collections import deque
+import threading
 
 import numpy as np
 import pandas as pd
@@ -21,7 +22,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.17"
+VERSION = "2.4.18"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -75,6 +76,132 @@ MIN_M5_SCORE_EDGE = 10
 
 SIGNAL_HISTORY = deque(maxlen=500)
 VIRTUAL_TRADES = deque(maxlen=500)
+
+
+# ==================================================
+# TWELVE DATA — PROCESS-LOCAL CREDIT BUDGET (BASIC PLAN)
+# ==================================================
+# Twelve Data Basic: 8 credits/minute, 800 credits/day; /time_series is
+# one credit per requested symbol. Keep one credit of headroom for occasional
+# independent API users. This counter protects only THIS Python process;
+# other programs sharing the key, multi-worker processes, and restarts are
+# detected through the provider's 429 response but are not pre-counted.
+TD_PROVIDER_MINUTE_CREDITS = max(4, int(os.getenv("TD_PROVIDER_MINUTE_CREDITS", "8")))
+TD_PROVIDER_DAILY_CREDITS = max(4, int(os.getenv("TD_PROVIDER_DAILY_CREDITS", "800")))
+TD_MINUTE_RESERVE = max(0, int(os.getenv("TD_MINUTE_RESERVE", "1")))
+TD_LOCAL_MINUTE_BUDGET = max(1, TD_PROVIDER_MINUTE_CREDITS - TD_MINUTE_RESERVE)
+TD_LIVE_SCAN_COST = len(ANALYSIS_TIMEFRAMES)  # 4 required calls before M1 retries.
+
+_TD_RATE_LOCK = threading.Lock()
+_TD_LIVE_SCAN_LOCK = threading.Lock()
+_TD_USAGE = {
+    "utc_minute": None,
+    "utc_day": None,
+    "minute_used": 0,
+    "day_used": 0,
+    "upstream_block_minute": None,
+    "upstream_block_day": None,
+    "last_upstream_429_utc": None,
+}
+
+
+def _td_reset_windows_locked(now):
+    minute = int(now.timestamp() // 60)
+    day = int(now.timestamp() // 86400)
+    if _TD_USAGE["utc_minute"] != minute:
+        _TD_USAGE["utc_minute"] = minute
+        _TD_USAGE["minute_used"] = 0
+        _TD_USAGE["upstream_block_minute"] = None
+    if _TD_USAGE["utc_day"] != day:
+        _TD_USAGE["utc_day"] = day
+        _TD_USAGE["day_used"] = 0
+        _TD_USAGE["upstream_block_day"] = None
+
+
+def _td_quota_snapshot():
+    with _TD_RATE_LOCK:
+        now = pd.Timestamp.now(tz="UTC")
+        _td_reset_windows_locked(now)
+        state = dict(_TD_USAGE)
+    return {
+        "scope": "current_process_only",
+        "provider_plan_minute_limit": TD_PROVIDER_MINUTE_CREDITS,
+        "local_minute_budget": TD_LOCAL_MINUTE_BUDGET,
+        "local_minute_used": state["minute_used"],
+        "local_minute_remaining": max(0, TD_LOCAL_MINUTE_BUDGET - state["minute_used"]),
+        "provider_plan_daily_limit": TD_PROVIDER_DAILY_CREDITS,
+        "local_day_used": state["day_used"],
+        "local_day_remaining": max(0, TD_PROVIDER_DAILY_CREDITS - state["day_used"]),
+        "upstream_minute_blocked": state["upstream_block_minute"] == state["utc_minute"],
+        "upstream_day_blocked": state["upstream_block_day"] == state["utc_day"],
+        "last_upstream_429_utc": state["last_upstream_429_utc"],
+        "warning": "External clients sharing the key and other worker processes are not counted.",
+    }
+
+
+def _td_budget_error(reason, now=None, m1_diagnostics=None):
+    now = now or pd.Timestamp.now(tz="UTC")
+    remaining_today = 86400 - int(now.timestamp()) % 86400
+    remaining_minute = 60 - int(now.timestamp()) % 60
+    daily = reason in ("LOCAL_DAILY_BUDGET", "UPSTREAM_DAILY_QUOTA")
+    retry_after = remaining_today if daily else remaining_minute
+    detail = {
+        "code": "API_RATE_LIMITED",
+        "reason": reason,
+        "message": "Twelve Data credit budget exhausted. This scan did not run; retry after quota reset.",
+        "retry_after_seconds": int(retry_after),
+        "quota_scope": "local_process_or_upstream_429",
+    }
+    if m1_diagnostics is not None:
+        detail["m1_diagnostics"] = m1_diagnostics
+    return HTTPException(status_code=429, detail=detail, headers={"Retry-After": str(retry_after)})
+
+
+def _td_claim_credits(credits=1, reserve_only=False):
+    """Check/claim credits atomically BEFORE making an actual network request.
+
+    For a 4-timeframe scan, reserve_only=True rejects an obviously
+    unaffordable scan at the start, without spending 1-3 credits on a partial
+    analysis. Each network request still claims a credit in its actual minute.
+    """
+    with _TD_RATE_LOCK:
+        now = pd.Timestamp.now(tz="UTC")
+        _td_reset_windows_locked(now)
+        reason = None
+        if _TD_USAGE["upstream_block_day"] == _TD_USAGE["utc_day"]:
+            reason = "UPSTREAM_DAILY_QUOTA"
+        elif _TD_USAGE["upstream_block_minute"] == _TD_USAGE["utc_minute"]:
+            reason = "UPSTREAM_MINUTE_QUOTA"
+        elif _TD_USAGE["day_used"] + credits > TD_PROVIDER_DAILY_CREDITS:
+            reason = "LOCAL_DAILY_BUDGET"
+        elif _TD_USAGE["minute_used"] + credits > TD_LOCAL_MINUTE_BUDGET:
+            reason = "LOCAL_MINUTE_BUDGET"
+        if reason:
+            raise _td_budget_error(reason, now)
+        if not reserve_only:
+            _TD_USAGE["minute_used"] += credits
+            _TD_USAGE["day_used"] += credits
+
+
+def _td_is_provider_429(exc):
+    message = str(exc).lower()
+    return ("429" in message and ("credit" in message or "rate" in message or "too many" in message))
+
+
+def _td_note_provider_429(exc):
+    message = str(exc).lower()
+    daily = "daily" in message or "per day" in message
+    with _TD_RATE_LOCK:
+        now = pd.Timestamp.now(tz="UTC")
+        _td_reset_windows_locked(now)
+        if daily:
+            _TD_USAGE["upstream_block_day"] = _TD_USAGE["utc_day"]
+        else:
+            _TD_USAGE["upstream_block_minute"] = _TD_USAGE["utc_minute"]
+        _TD_USAGE["last_upstream_429_utc"] = now.isoformat()
+    logger.warning("Twelve Data upstream 429: quota exhausted (%s); back off until UTC reset", "daily" if daily else "minute")
+    return _td_budget_error("UPSTREAM_DAILY_QUOTA" if daily else "UPSTREAM_MINUTE_QUOTA", now)
+
 
 
 # ==================================================
@@ -190,6 +317,7 @@ def get_market_data(
                 "%Y-%m-%d %H:%M:%S"
             )
         provider_request_started_at = pd.Timestamp.now(tz="UTC")
+        _td_claim_credits(1)
         response = td.time_series(**request_args)
 
         df = response.as_pandas()
@@ -310,7 +438,9 @@ def get_market_data(
     except HTTPException:
         raise
 
-    except Exception:
+    except Exception as exc:
+        if _td_is_provider_429(exc):
+            raise _td_note_provider_429(exc) from exc
         logger.exception(
             "Ошибка получения данных %s %s",
             pair,
@@ -319,7 +449,7 @@ def get_market_data(
         raise HTTPException(
             status_code=502,
             detail="Ошибка получения данных Twelve Data"
-        )
+        ) from exc
 
 
 # ==================================================
@@ -1652,9 +1782,16 @@ def _refresh_missing_m1_bar(pair, market_data, analysis_at_utc):
             # already valid initial snapshot or create a false signal.
             meta["history"].append({
                 "attempt": i + 1,
-                "result": "RETRY_FAILED",
+                "result": "API_RATE_LIMITED" if exc.status_code == 429 else "RETRY_FAILED",
                 "http_status": exc.status_code,
             })
+            if exc.status_code == 429:
+                meta["stop_reason"] = "API_RATE_LIMITED"
+                meta["rate_limit_reason"] = (
+                    exc.detail.get("reason", "LOCAL_MINUTE_BUDGET")
+                    if isinstance(exc.detail, dict) else "LOCAL_MINUTE_BUDGET"
+                )
+                break
             continue
         candidate_open = pd.Timestamp(candidate.index[-1])
         provider_diag = candidate.attrs.get("live_provider_diagnostics", {})
@@ -1682,6 +1819,21 @@ def _refresh_missing_m1_bar(pair, market_data, analysis_at_utc):
 
 @app.post("/api/signal")
 def get_signal(req: SignalRequest):
+    """No overlapping live scans inside this process; fail fast when quota is low."""
+    if not _TD_LIVE_SCAN_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail={
+            "code": "SCAN_BUSY",
+            "message": "Another live scan is already running; duplicate request rejected without spending API credits.",
+            "retry_after_seconds": 5,
+        }, headers={"Retry-After": "5"})
+    try:
+        _td_claim_credits(TD_LIVE_SCAN_COST, reserve_only=True)
+        return _get_signal_core(req)
+    finally:
+        _TD_LIVE_SCAN_LOCK.release()
+
+
+def _get_signal_core(req: SignalRequest):
     pair = req.pair.strip().upper()
     requested_timeframe = req.timeframe.strip()
 
@@ -1705,6 +1857,14 @@ def get_signal(req: SignalRequest):
         for tf in ANALYSIS_TIMEFRAMES
     }
     retry_audit = _refresh_missing_m1_bar(pair, market_data, analysis_at_utc)
+    if retry_audit.get("stop_reason") == "API_RATE_LIMITED":
+        raise _td_budget_error(
+            retry_audit.get("rate_limit_reason", "LOCAL_MINUTE_BUDGET"),
+            m1_diagnostics={
+                "provider_diagnostics": market_data["1min"].attrs.get("live_provider_diagnostics"),
+                "m1_refresh": retry_audit,
+            },
+        )
 
     result = analyze_multi_timeframe(market_data)
     observed_at_utc = pd.Timestamp.now(tz="UTC")
@@ -3745,6 +3905,12 @@ def api_health():
         "m1_source_timing_audit": True,
         "m1_missing_closed_bar_bounded_retry": bool(M1_RETRY_ENABLED),
         "m1_max_refresh_attempts": M1_RETRY_MAX_ATTEMPTS,
+        "td_credit_guard_enabled": True,
+        "td_local_minute_budget": TD_LOCAL_MINUTE_BUDGET,
+        "td_provider_minute_limit": TD_PROVIDER_MINUTE_CREDITS,
+        "td_local_daily_budget": TD_PROVIDER_DAILY_CREDITS,
+        "td_overlapping_live_scans_blocked": True,
+        "td_upstream_429_circuit_breaker": True,
         "stale_scan_audit": True,
         "retrospective_virtual_fills_disabled": True,
     }
@@ -4103,7 +4269,8 @@ def paper_monitor(limit: int = Query(default=12, ge=1, le=50)):
         "status_counts_last_24_hours": {row["result_status"]: int(row["n"]) for row in counts},
         "recent_scans": runs,
         "max_signal_age_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS,
-        "note": "Shows authenticated scan calls, whether automatic or manual. No broker execution. Old records have null freshness metadata.",
+        "twelvedata_budget": _td_quota_snapshot(),
+        "note": "Shows authenticated scan calls, whether automatic or manual. Local API counters do not include other applications or worker processes. No broker execution.",
     }
 
 
@@ -4128,7 +4295,26 @@ def paper_scan(req: PaperScanRequest):
     if timeframe not in ("1min", "5min"):
         raise HTTPException(status_code=400, detail="Paper test supports 1min and 5min expiry")
 
-    signal_data = get_signal(SignalRequest(pair=pair, timeframe=timeframe))
+    try:
+        signal_data = get_signal(SignalRequest(pair=pair, timeframe=timeframe))
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        code = detail.get("code")
+        if exc.status_code == 429 and code in ("API_RATE_LIMITED", "SCAN_BUSY"):
+            status = "SCAN_BUSY" if code == "SCAN_BUSY" else "API_RATE_LIMITED"
+            reason = str(detail.get("reason") or detail.get("message") or status)
+            m1_diagnostics = detail.get("m1_diagnostics") or {}
+            rejected_timing = {"candles": {"1min": m1_diagnostics}} if m1_diagnostics else None
+            return _paper_record_scan_result(pair, timeframe, {
+                "status": status,
+                "stored": False,
+                "pair": pair,
+                "reason": reason,
+                "strategy_version": VERSION,
+                "retry_after_seconds": detail.get("retry_after_seconds"),
+                "twelvedata_budget": _td_quota_snapshot(),
+            }, reason=reason, timing=rejected_timing)
+        raise
     timing = dict(signal_data["freshness"])
     candle_open = _paper_time(signal_data["candle_time"])
     available_at = candle_open + TIMEFRAMES["1min"]
