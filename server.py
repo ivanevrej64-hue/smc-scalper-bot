@@ -22,7 +22,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.19"
+VERSION = "2.4.20"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -4102,6 +4102,342 @@ def backtest_conservative_execution(req: BacktestRobustnessRequest):
 
 
 # ==================================================
+# v2.4.20 — ISOLATED RESEARCH BACKTEST
+# ==================================================
+# This code path is NEVER called by /api/signal or /api/paper/scan.
+# Variants are experimental hypotheses, not live trading strategies.
+
+class BacktestResearchRequest(BaseModel):
+    pair: str = Field(default="EUR/USD")
+    candles: int = Field(default=2000, ge=1000, le=5000)
+    market_mode: str = Field(default="regular_forex")
+    # The minute-within-each-10-minute UTC slot, not necessarily the
+    # actual timezone configured on cron-job.org.
+    cron_utc_minute_offset: int = Field(default=7, ge=0, le=9)
+    cooldown_minutes: int = Field(default=5, ge=0, le=30)
+
+
+RESEARCH_VARIANTS = (
+    "baseline_2419",
+    "h1_ema_order_only",
+    "m15_structure_fallback",
+    "m5_ema_trend_fallback",
+    "m1_three_candle_breakout",
+)
+RESEARCH_ADVERSE_ENTRY_PIPS = (0.0, 0.2, 0.5, 1.0)
+
+
+def _research_variant_parts(baseline_analysis, windows, variant):
+    """Shallow-copy 4 historical components; never mutate live components."""
+    parts = {tf: dict(baseline_analysis[tf]) for tf in ("H1", "M15", "M5", "M1")}
+    if variant == "h1_ema_order_only" and parts["H1"]["signal"] == "WAIT":
+        fast, slow = parts["H1"]["ema20"], parts["H1"]["ema50"]
+        if fast != slow:
+            parts["H1"].update(signal="CALL" if fast > slow else "PUT", score=20)
+
+    if variant == "m15_structure_fallback" and parts["M15"]["signal"] == "WAIT":
+        structure = parts["M15"].get("market_structure")
+        if structure in ("BULLISH", "BEARISH"):
+            parts["M15"].update(
+                signal="CALL" if structure == "BULLISH" else "PUT", score=25,
+            )
+
+    if variant == "m5_ema_trend_fallback" and parts["M5"]["signal"] == "WAIT":
+        closes = windows["5min"]["close"]
+        fast = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
+        slow = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
+        price = float(closes.iloc[-1])
+        if price > fast > slow:
+            parts["M5"].update(signal="CALL", score=20)
+        elif price < fast < slow:
+            parts["M5"].update(signal="PUT", score=20)
+
+    if variant == "m1_three_candle_breakout" and parts["M1"]["signal"] == "WAIT":
+        candles = windows["1min"]
+        recent = candles.iloc[-4:-1]  # Exactly the three PREVIOUS, closed M1 bars.
+        last = candles.iloc[-1]
+        atr = float(parts["M1"].get("atr") or calculate_atr(candles))
+        if len(recent) == 3 and atr > 0:
+            body = abs(float(last["close"] - last["open"]))
+            candle_range = float(last["high"] - last["low"])
+            valid_body = (
+                candle_range > 0 and body >= atr * 0.2
+                and body / candle_range >= 0.35
+                and candle_range <= atr * 2.5
+            )
+            if valid_body:
+                if (float(last["close"]) > float(last["open"]) and
+                        float(last["close"]) > float(recent["high"].max()) + atr * 0.03):
+                    parts["M1"].update(signal="CALL", score=10)
+                elif (float(last["close"]) < float(last["open"]) and
+                      float(last["close"]) < float(recent["low"].min()) - atr * 0.03):
+                    parts["M1"].update(signal="PUT", score=10)
+    return parts
+
+
+def _research_decision(parts):
+    """Same four-way strict agreement and MIN_SCORE as live 2.4.19."""
+    signals = [parts[tf]["signal"] for tf in ("H1", "M15", "M5", "M1")]
+    score = {"CALL": 0, "PUT": 0}
+    weights = {"H1": 20, "M15": 25, "M1": 10}
+    for tf in ("H1", "M15", "M5", "M1"):
+        direction = parts[tf]["signal"]
+        if direction in score:
+            score[direction] += (
+                int(parts["M5"].get("score", 0)) if tf == "M5" else weights[tf]
+            )
+    direction = signals[0]
+    if direction in score and all(s == direction for s in signals) and score[direction] >= MIN_SCORE:
+        return direction, score
+    return "WAIT", score
+
+
+def _research_new_counter():
+    return {
+        "signals_generated": 0, "signals_by_direction": {"CALL": 0, "PUT": 0},
+        "stage_counts": _new_funnel_counts(),
+        "events": [], "raw_changed_vs_baseline": 0,
+    }
+
+
+def _research_settlement(events, m1, pair, cron_offset, cooldown):
+    """Settle to exact 1-minute candle close, with fixed adverse entry stress.
+
+    A 0.2-pip adverse price offset is NOT an estimate of 20-second latency;
+    there are no sub-minute prices in the input data.
+    """
+    pip_size = _pip_size_for_pair(pair)
+    outcomes = {str(pips): {"wins": 0, "losses": 0, "draws": 0} for pips in RESEARCH_ADVERSE_ENTRY_PIPS}
+    samples = []
+    resolved = 0
+    unresolved = 0
+    for event in events:
+        expiry = event["entry_time"] + TIMEFRAMES["1min"]
+        exit_data = _m1_candle_at_expiry(m1, expiry)
+        if exit_data is None:
+            unresolved += 1
+            continue
+        resolved += 1
+        exit_price = float(exit_data["exit_price"])
+        for pips in RESEARCH_ADVERSE_ENTRY_PIPS:
+            entry_price = float(event["entry_price"])
+            entry_price += (1 if event["signal"] == "CALL" else -1) * pips * pip_size
+            outcome = _expiry_outcome(event["signal"], entry_price, exit_price)
+            bucket = {"WIN": "wins", "LOSS": "losses", "DRAW": "draws"}[outcome]
+            outcomes[str(pips)][bucket] += 1
+        if len(samples) < 10:
+            samples.append({
+                "entry_time_utc": event["entry_time"].isoformat(),
+                "signal": event["signal"],
+                "entry_price_at_close": float(event["entry_price"]),
+                "expiry_price_at_close": exit_price,
+                "outcome_at_zero_adverse_pips": _expiry_outcome(
+                    event["signal"], float(event["entry_price"]), exit_price
+                ),
+            })
+
+    sensitivity = {}
+    for pips in RESEARCH_ADVERSE_ENTRY_PIPS:
+        row = outcomes[str(pips)]
+        count = sum(row.values())
+        sensitivity[str(pips)] = {
+            **row,
+            "win_rate_percent": round(row["wins"] * 100 / count, 2) if count else None,
+            "payout_80_net_stake_units": round(row["wins"] * 0.8 - row["losses"], 4),
+        }
+    # Cron-aligned opportunities are hypothetical minute-slot samples only:
+    # provider availability and actual cron timezone/lag cannot be inferred.
+    cron_events = [e for e in events if e["entry_time"].minute % 10 == cron_offset]
+    chronological = sorted(events, key=lambda e: e["entry_time"])
+    spaced = []
+    last_entry = None
+    for event in chronological:
+        if last_entry is None or event["entry_time"] >= last_entry + timedelta(minutes=cooldown):
+            spaced.append(event)
+            last_entry = event["entry_time"]
+    return {
+        "resolved": resolved,
+        "unresolved_expiry_candles": unresolved,
+        "win_rate_percent": sensitivity["0.0"]["win_rate_percent"],
+        "payout_analysis": _payout_analysis(
+            outcomes["0.0"]["wins"], outcomes["0.0"]["losses"], outcomes["0.0"]["draws"]
+        ),
+        "adverse_entry_price_pips_sensitivity": sensitivity,
+        "cron_ten_minute_proxy": {
+            "minute_offset_utc": cron_offset,
+            "candidate_signals_on_these_minute_slots": len(cron_events),
+            "no_provider_arrival_or_runtime_guarantee": True,
+        },
+        "cooldown_proxy": {
+            "minutes": cooldown,
+            "raw_signals": len(events),
+            "non_overlapping_candidates": len(spaced),
+        },
+        "sample_settled_trades": samples,
+    }
+
+
+def run_research_backtest(pair, candle_count=2000, market_mode="regular_forex",
+                          cron_offset=7, cooldown=5, history_override=None):
+    """One shared history, one baseline calculation per M1 point, isolated variants."""
+    if pair not in ALLOWED_PAIRS:
+        raise HTTPException(status_code=400, detail="Неподдерживаемая валютная пара")
+    if market_mode not in ("regular_forex", "all_data"):
+        raise HTTPException(status_code=400, detail="Недопустимый market_mode")
+    if not (1000 <= int(candle_count) <= BACKTEST_CANDLE_LIMIT):
+        raise HTTPException(status_code=400, detail="candles должен быть от 1000 до 5000")
+    if not (0 <= cron_offset <= 9 and 0 <= cooldown <= 30):
+        raise HTTPException(status_code=400, detail="Недопустимые параметры расписания")
+
+    raw_history = history_override if history_override is not None else {
+        tf: get_market_data(pair, tf, outputsize=candle_count)
+        for tf in ANALYSIS_TIMEFRAMES
+    }
+    history = {
+        tf: (_regular_forex_filter(raw_history[tf], tf)
+             if market_mode == "regular_forex" else raw_history[tf].copy())
+        for tf in ANALYSIS_TIMEFRAMES
+    }
+    if any(len(history[tf]) == 0 for tf in ANALYSIS_TIMEFRAMES):
+        raise HTTPException(status_code=422, detail="Нет свечей в выбранной сессии")
+    m1 = history["1min"]
+    if len(m1) < 1000:
+        raise HTTPException(status_code=502, detail="Для исследования требуется не менее 1000 M1 свечей")
+    counters = {variant: _research_new_counter() for variant in RESEARCH_VARIANTS}
+    evaluated = 0
+    skipped = 0
+    temporal_violations = 0
+    altered_component_counts = {v: 0 for v in RESEARCH_VARIANTS if v != "baseline_2419"}
+    for i in range(len(m1)):
+        m1_open = m1.index[i]
+        evaluation_time = m1_open + TIMEFRAMES["1min"]
+        windows = {
+            tf: _closed_candle_slice(history[tf], tf, evaluation_time, max_rows=CANDLE_LIMIT)
+            for tf in ANALYSIS_TIMEFRAMES
+        }
+        if any(len(windows[tf]) < 60 for tf in ANALYSIS_TIMEFRAMES):
+            skipped += 1
+            continue
+        if (windows["1min"].index[-1] != m1_open or any(
+            windows[tf].index[-1] + TIMEFRAMES[tf] > evaluation_time
+            for tf in ANALYSIS_TIMEFRAMES
+        )):
+            temporal_violations += 1
+            raise HTTPException(status_code=502, detail="BACKTEST_LOOKAHEAD_BLOCKED")
+        evaluated += 1
+        base = analyze_multi_timeframe(windows, include_m5_diagnostics=False)
+        base_parts = base["analysis"]
+        reconstructed_signal, reconstructed_score = _research_decision(base_parts)
+        if reconstructed_signal != base["signal"] or reconstructed_score != {
+            "CALL": base["score"]["CALL"], "PUT": base["score"]["PUT"]
+        }:
+            raise HTTPException(status_code=502, detail="RESEARCH_BASELINE_MISMATCH")
+
+        for variant, entry in counters.items():
+            parts = (base_parts if variant == "baseline_2419"
+                     else _research_variant_parts(base_parts, windows, variant))
+            if variant != "baseline_2419":
+                timeframe = {"h1_ema_order_only":"H1", "m15_structure_fallback":"M15",
+                             "m5_ema_trend_fallback":"M5", "m1_three_candle_breakout":"M1"}[variant]
+                if parts[timeframe]["signal"] != base_parts[timeframe]["signal"]:
+                    altered_component_counts[variant] += 1
+            signal, scores = _research_decision(parts)
+            if signal != base["signal"]:
+                entry["raw_changed_vs_baseline"] += 1
+            # One mutually exclusive stage per M1 evaluation.
+            synthetic = {"analysis": parts, "signal": signal}
+            stage = _classify_evaluation_stage(synthetic)
+            entry["stage_counts"][stage] += 1
+            if signal in ("CALL", "PUT"):
+                entry["signals_generated"] += 1
+                entry["signals_by_direction"][signal] += 1
+                entry["events"].append({
+                    "entry_time": evaluation_time,
+                    "entry_price": float(m1.iloc[i]["close"]),
+                    "signal": signal,
+                    "scores": scores,
+                })
+
+    result_variants = {}
+    for variant, entry in counters.items():
+        settlement = _research_settlement(entry["events"], m1, pair, cron_offset, cooldown)
+        result_variants[variant] = {
+            "hypothesis": {
+                "baseline_2419": "Неизменённая стратегия 2.4.19",
+                "h1_ema_order_only": "H1: направление только по порядку EMA20/50, без фильтра цены",
+                "m15_structure_fallback": "M15: если BOS/CHoCH отсутствует, использовать подтвержденную структуру swings",
+                "m5_ema_trend_fallback": "M5: если модели Sweep/FVG/OB отсутствуют, разрешить сильное EMA20/50 направление",
+                "m1_three_candle_breakout": "M1: если пробой четырех свечей отсутствует, проверить три предыдущие с теми же ATR/телом",
+            }[variant],
+            "evaluated_points": evaluated,
+            "signals_generated": entry["signals_generated"],
+            "signals_per_1000_evaluations": round(entry["signals_generated"] * 1000 / evaluated, 2) if evaluated else 0,
+            "signals_by_direction": entry["signals_by_direction"],
+            "changed_final_decisions_vs_baseline": entry["raw_changed_vs_baseline"],
+            "stage_counts": entry["stage_counts"],
+            **settlement,
+        }
+
+    return {
+        "strategy_version": VERSION,
+        "research_only": True,
+        "live_signal_rules_unchanged": True,
+        "paper_scan_rules_unchanged": True,
+        "comparison_isolated_one_change_per_variant": True,
+        "pair": pair,
+        "expiry_timeframe": "1min",
+        "market_mode": market_mode,
+        "requested_m1_candles": candle_count,
+        "available_candles": {tf: int(len(history[tf])) for tf in ANALYSIS_TIMEFRAMES},
+        "evaluated_points": evaluated,
+        "skipped_points_insufficient_history": skipped,
+        "future_candle_violations": temporal_violations,
+        "baseline_consistency_checked_each_evaluation": True,
+        "altered_single_timeframe_signal_counts": altered_component_counts,
+        "variants": result_variants,
+        "latency_analysis": {
+            "historical_20_or_30_second_entry_price": "UNOBSERVABLE_FROM_M1_CANDLES",
+            "adverse_entry_pips_is_stress_test_not_latency_estimate": True,
+            "ten_minute_slot_is_proxy_not_verified_cron_execution": True,
+        },
+        "warnings": [
+            "Исследовательские варианты НЕ работают в /api/signal или /api/paper/scan.",
+            "Сигналы на соседних M1 свечах зависимы и не являются независимыми сделками.",
+            "Изменённые правила могут переобучиться на выбранном участке рынка.",
+            "Стресс смещения цены входа в пипсах не моделирует задержку 10/20/30 секунд.",
+            "Нет тиковых цен, спреда, выплат брокера в момент входа и реального исполнения.",
+            "Статистика истории не гарантирует будущий результат и не разрешает реальные сделки.",
+            "По четырём запросам истории расходуются кредиты Twelve Data; повторов в одном запуске нет.",
+        ],
+    }
+
+
+@app.post("/api/backtest/research")
+def backtest_strategy_research(req: BacktestResearchRequest):
+    # This research can take seconds: never compete with a live paper scan
+    # for the same in-process Eight-credit Twelve Data allowance.
+    if not _TD_LIVE_SCAN_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail={
+            "code": "RESEARCH_OR_SCAN_BUSY",
+            "message": "A live scan or research run is already in progress; try again later.",
+        }, headers={"Retry-After": "15"})
+    try:
+        _td_claim_credits(TD_LIVE_SCAN_COST, reserve_only=True)
+        pair = req.pair.strip().upper()
+        result = run_research_backtest(
+            pair=pair,
+            candle_count=req.candles,
+            market_mode=req.market_mode,
+            cron_offset=req.cron_utc_minute_offset,
+            cooldown=req.cooldown_minutes,
+        )
+        return make_json_safe(result)
+    finally:
+        _TD_LIVE_SCAN_LOCK.release()
+
+
+
+# ==================================================
 # HEALTH
 # ==================================================
 
@@ -4142,6 +4478,8 @@ def api_health():
         "m1_live_fetch_priority": True,
         "paper_decision_audit_persisted": True,
         "paper_diagnostics_report": True,
+        "isolated_strategy_research_backtest": True,
+        "research_live_rules_unchanged": True,
         "td_credit_guard_enabled": True,
         "td_local_minute_budget": TD_LOCAL_MINUTE_BUDGET,
         "td_provider_minute_limit": TD_PROVIDER_MINUTE_CREDITS,
