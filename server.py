@@ -22,7 +22,7 @@ from twelvedata import TDClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-VERSION = "2.4.20"
+VERSION = "2.4.21"
 
 app = FastAPI(
     title="SMC Signal Bot",
@@ -1910,6 +1910,221 @@ def _live_decision_audit(signal_data):
     })
 
 
+# ==================================================
+# v2.4.21 — ISOLATED M5 SHADOW OBSERVATIONS (PAPER ONLY)
+# ==================================================
+# Uses the EXACT SAME historical hypothesis function as v2.4.20.
+# The sole data source is the live scan's already-downloaded H1/M15/M5/M1.
+# No real, DEMO or retrospective broker fills are created.
+
+def _shadow_m5_observation(base_result, market_data, freshness, observed_at_utc,
+                           raw_signal, candle_time, reference_close):
+    baseline_parts = base_result["analysis"]
+    reconstructed, reconstructed_score = _research_decision(baseline_parts)
+    live_score = base_result.get("score") or {}
+    score_mismatch = (
+        reconstructed_score["CALL"] != live_score.get("CALL")
+        or reconstructed_score["PUT"] != live_score.get("PUT")
+    )
+    if reconstructed != raw_signal or score_mismatch:
+        # Fail CLOSED on a logic mismatch: baseline remains untouched.
+        logger.error("SHADOW_BASELINE_MISMATCH direction=%s/%s scores=%s/%s",
+                     reconstructed, raw_signal, reconstructed_score, live_score)
+        return {"variant": "m5_ema_trend_fallback", "status": "BASELINE_MISMATCH",
+                "candidate": False, "reference_outcome_status": "UNAVAILABLE"}
+
+    altered_parts = _research_variant_parts(
+        baseline_parts, {"5min": market_data["5min"]}, "m5_ema_trend_fallback"
+    )
+    alternative, alternative_score = _research_decision(altered_parts)
+    signal_available = pd.Timestamp(candle_time).tz_convert("UTC") + TIMEFRAMES["1min"]
+    expiry_at = signal_available + TIMEFRAMES["1min"]
+    age = float((pd.Timestamp(observed_at_utc) - signal_available).total_seconds())
+    return make_json_safe({
+        "variant": "m5_ema_trend_fallback",
+        "hypothesis": "M5 EMA20/50 fallback only when original M5 is WAIT",
+        "status": "OBSERVED",
+        "baseline_raw_signal": raw_signal,
+        "alternative_raw_signal": alternative,
+        "baseline_m5_signal": baseline_parts["M5"]["signal"],
+        "alternative_m5_signal": altered_parts["M5"]["signal"],
+        "fallback_applied": baseline_parts["M5"]["signal"] == "WAIT" and altered_parts["M5"]["signal"] in ("CALL", "PUT"),
+        "changed_decision_vs_baseline": alternative != raw_signal,
+        "score": alternative_score,
+        "candidate": alternative in ("CALL", "PUT"),
+        "signal_candle_open_utc": candle_time,
+        "reference_entry_at_utc": signal_available.isoformat(),
+        "reference_expiry_at_utc": expiry_at.isoformat(),
+        "reference_entry_close": float(reference_close),
+        "observed_at_utc": _paper_iso(observed_at_utc),
+        "observed_age_seconds": round(age, 3),
+        "eligible_freshness_initial": freshness.get("status") == "FRESH",
+        "reference_outcome_status": "UNDETERMINED",
+        "no_actual_entry_or_broker_execution": True,
+    })
+
+
+def _shadow_finalize_observation(observation, timing, expiry_timeframe):
+    """Second freshness check; NEVER turn a stale scan into a shadow trade."""
+    if not isinstance(observation, dict):
+        return None
+    item = dict(observation)
+    if item.get("status") != "OBSERVED":
+        item["eligible"] = False
+        return item
+    item["eligible"] = bool(
+        expiry_timeframe == "1min"
+        and item.get("candidate")
+        and item.get("eligible_freshness_initial")
+        and timing.get("status") == "FRESH"
+        and timing.get("signal_age_seconds") is not None
+        and 0 <= float(timing["signal_age_seconds"]) <= PAPER_MAX_SIGNAL_AGE_SECONDS
+    )
+    item["observed_age_seconds"] = timing.get("signal_age_seconds")
+    item["reference_outcome_status"] = (
+        "PENDING_REFERENCE_CLOSE" if item["eligible"]
+        else "REJECTED_STALE" if item.get("candidate") and (
+            timing.get("status") != "FRESH" or not item.get("eligible_freshness_initial")
+        ) else "NOT_APPLICABLE_TIMEFRAME" if expiry_timeframe != "1min"
+        else "NO_CANDIDATE"
+    )
+    return make_json_safe(item)
+
+
+def _paper_shadow_settle_pending(pair, closed_m1):
+    """Settle earlier fresh candidates from CLOSED M1 bars in the SAME scan.
+
+    Only a hypothetical signal-close-to-next-close directional reference;
+    the actual entry price 10–30s later is unobservable from M1 candles.
+    All operations are idempotent; no Twelve Data calls or trade writes.
+    """
+    import json
+    if not closed_m1:
+        return 0
+    closes = {_paper_iso(k): float(v) for k, v in closed_m1.items()}
+    latest_open = max(pd.Timestamp(k) for k in closes)
+    # Read recent rows that could still fall into the 150 M1 candles window.
+    cutoff = _paper_iso(_paper_now() - pd.Timedelta(hours=4))
+    count = 0
+    with _paper_db() as conn:
+        rows = _paper_exec(conn, """
+            SELECT id, last_candles_json FROM paper_scan_runs
+            WHERE pair=? AND scanned_at_utc>=?
+              AND last_candles_json LIKE ?
+            ORDER BY scanned_at_utc DESC LIMIT 150
+        """, (pair, cutoff, '%"_v2421_shadow"%')).fetchall()
+        for row in rows:
+            payload = _paper_parse_diagnostic_payload(row["last_candles_json"])
+            shadow = payload.get("_v2421_shadow") or {}
+            if (not isinstance(shadow, dict) or not shadow.get("eligible")
+                    or shadow.get("reference_outcome_status") != "PENDING_REFERENCE_CLOSE"):
+                continue
+            expiry_at = pd.Timestamp(shadow["reference_expiry_at_utc"])
+            expiry_open = expiry_at - TIMEFRAMES["1min"]
+            # Do not pretend to know a candle before it is closed. The newer
+            # snapshot always consists of provider-filtered closed candles.
+            if expiry_open + TIMEFRAMES["1min"] > latest_open + TIMEFRAMES["1min"]:
+                continue
+            exit_price = closes.get(_paper_iso(expiry_open))
+            if exit_price is None:
+                continue   # no imputation, no retrospective fill
+            original_close = float(shadow["reference_entry_close"])
+            outcome = _expiry_outcome(shadow["alternative_raw_signal"], original_close, exit_price)
+            shadow["reference_outcome_status"] = "SETTLED_CANDLE_CLOSE_PROXY"
+            shadow["reference_exit_close"] = float(exit_price)
+            shadow["reference_outcome"] = outcome
+            shadow["reference_settled_at_utc"] = _paper_iso(_paper_now())
+            shadow["no_actual_entry_or_broker_execution"] = True
+            payload["_v2421_shadow"] = shadow
+            _paper_exec(conn, """UPDATE paper_scan_runs SET last_candles_json=?
+                                 WHERE id=?""", (json.dumps(make_json_safe(payload), ensure_ascii=False), row["id"]))
+            count += 1
+    return count
+
+
+def _paper_shadow_summary(rows, hours, truncated=False):
+    """Report shadow outcomes only for eligible, FRESH observations.
+
+    Reference candle-close outcomes are NOT executable trade results and
+    never compute monetary returns, ROI or broker win-rate.
+    """
+    from collections import Counter
+    stats = Counter()
+    direction = Counter()
+    baseline = Counter()
+    outcome = Counter()
+    ages = []
+    for row in rows:
+        payload = _paper_parse_diagnostic_payload(row["last_candles_json"])
+        observation = payload.get("_v2421_shadow")
+        if not isinstance(observation, dict):
+            continue
+        stats["observations"] += 1
+        if observation.get("status") != "OBSERVED":
+            stats["shadow_errors_or_mismatches"] += 1
+            continue
+        baseline[str(observation.get("baseline_raw_signal") or "UNKNOWN")] += 1
+        shadow_signal = str(observation.get("alternative_raw_signal") or "UNKNOWN")
+        direction[shadow_signal] += 1
+        if observation.get("fallback_applied"):
+            stats["m5_fallback_applied"] += 1
+        if observation.get("changed_decision_vs_baseline"):
+            stats["changed_final_decisions"] += 1
+        if observation.get("candidate"):
+            stats["candidate_total"] += 1
+            if observation.get("baseline_raw_signal") == "WAIT":
+                stats["incremental_candidates_all"] += 1
+        if observation.get("eligible"):
+            stats["eligible_fresh_candidates"] += 1
+            if observation.get("baseline_raw_signal") == "WAIT":
+                stats["incremental_candidates_fresh"] += 1
+            if isinstance(observation.get("observed_age_seconds"), (int, float)):
+                ages.append(float(observation["observed_age_seconds"]))
+            state = observation.get("reference_outcome_status")
+            if state == "PENDING_REFERENCE_CLOSE":
+                stats["pending_reference_close"] += 1
+            elif state == "SETTLED_CANDLE_CLOSE_PROXY":
+                stats["settled_reference_close"] += 1
+                outcome[str(observation.get("reference_outcome") or "UNKNOWN")] += 1
+        elif observation.get("candidate"):
+            stats["ineligible_candidates_stale_or_wrong_expiry"] += 1
+    return {
+        "version": VERSION, "mode": "DEMO_ONLY", "variant": "m5_ema_trend_fallback",
+        "window_hours": int(hours), "scans_examined": len(rows),
+        "truncated_to_safety_limit": bool(truncated),
+        "observations": stats["observations"],
+        "shadow_errors_or_mismatches": stats["shadow_errors_or_mismatches"],
+        "baseline_raw_signals": dict(baseline),
+        "shadow_raw_signals": dict(direction),
+        "m5_fallback_applied": stats["m5_fallback_applied"],
+        "changed_final_decisions": stats["changed_final_decisions"],
+        "candidate_total": stats["candidate_total"],
+        "incremental_candidates_all": stats["incremental_candidates_all"],
+        "incremental_candidates_fresh": stats["incremental_candidates_fresh"],
+        "eligible_fresh_candidates": stats["eligible_fresh_candidates"],
+        "ineligible_candidates_stale_or_wrong_expiry": stats["ineligible_candidates_stale_or_wrong_expiry"],
+        "pending_reference_close": stats["pending_reference_close"],
+        "settled_reference_close": stats["settled_reference_close"],
+        "reference_outcomes_approximate_not_broker": dict(outcome),
+        "avg_age_of_eligible_candidates_seconds": round(sum(ages)/len(ages), 2) if ages else None,
+        "actual_broker_entries": 0,
+        "api_credits_spent_by_shadow": 0,
+        "note": "Shadow does not place DEMO/real trades. Reference WIN/LOSS uses previous M1 close as hypothetical entry and next M1 close as exit, NOT an observable broker fill at signal receipt. Only authenticated scheduled scans are measured.",
+    }
+
+
+def _paper_query_shadow_summary(hours=24):
+    _paper_initialize()
+    cutoff = _paper_iso(_paper_now() - pd.Timedelta(hours=hours))
+    cap = 5000
+    with _paper_db() as conn:
+        rows = _paper_exec(conn, """
+            SELECT last_candles_json FROM paper_scan_runs
+            WHERE scanned_at_utc >= ? ORDER BY scanned_at_utc DESC LIMIT ?
+        """, (cutoff, cap+1)).fetchall()
+    return _paper_shadow_summary(rows[:cap], hours, truncated=len(rows) > cap)
+
+
 def _paper_scan_diagnostic_payload(timing):
     """Keep the existing DB schema; append a versioned namespace to JSON."""
     payload = dict((timing or {}).get("candles") or {})
@@ -1917,6 +2132,8 @@ def _paper_scan_diagnostic_payload(timing):
         payload["_v2419_decision_audit"] = timing["decision_audit"]
     if (timing or {}).get("live_pipeline") is not None:
         payload["_v2419_live_pipeline"] = timing["live_pipeline"]
+    if (timing or {}).get("shadow_observation") is not None:
+        payload["_v2421_shadow"] = timing["shadow_observation"]
     return payload
 
 
@@ -2037,9 +2254,8 @@ def _paper_query_diagnostic_summary(hours=24):
 # API: SIGNAL
 # ==================================================
 
-@app.post("/api/signal")
-def get_signal(req: SignalRequest):
-    """No overlapping live scans inside this process; fail fast when quota is low."""
+def _execute_live_scan(req: SignalRequest, *, shadow_capture=False):
+    """Shared, quota-protected scan. Shadow metadata is paper-only and private."""
     if not _TD_LIVE_SCAN_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=429, detail={
             "code": "SCAN_BUSY",
@@ -2048,12 +2264,18 @@ def get_signal(req: SignalRequest):
         }, headers={"Retry-After": "5"})
     try:
         _td_claim_credits(TD_LIVE_SCAN_COST, reserve_only=True)
-        return _get_signal_core(req)
+        return _get_signal_core(req, shadow_capture=shadow_capture)
     finally:
         _TD_LIVE_SCAN_LOCK.release()
 
 
-def _get_signal_core(req: SignalRequest):
+@app.post("/api/signal")
+def get_signal(req: SignalRequest):
+    """Unchanged public live signal contract and original scoring rules."""
+    return _execute_live_scan(req, shadow_capture=False)
+
+
+def _get_signal_core(req: SignalRequest, *, shadow_capture=False):
     pair = req.pair.strip().upper()
     requested_timeframe = req.timeframe.strip()
 
@@ -2160,6 +2382,29 @@ def _get_signal_core(req: SignalRequest):
         "freshness": freshness,
         "live_pipeline": live_pipeline,
     }
+
+    # Authenticated paper scans can reuse the ALREADY FETCHED candles for
+    # isolated shadow evaluation and later reference-close settlement.
+    # /api/signal never receives these private fields or additional API calls.
+    if shadow_capture:
+        try:
+            response["_paper_shadow_observation"] = _shadow_m5_observation(
+                result, market_data, freshness, observed_at_utc,
+                raw_signal, candle_time, price,
+            )
+        except Exception:
+            logger.exception("Shadow observation failed; baseline signal remains unchanged")
+            response["_paper_shadow_observation"] = {
+                "variant": "m5_ema_trend_fallback", "status": "SHADOW_ERROR",
+                "candidate": False, "reference_outcome_status": "UNAVAILABLE",
+            }
+        # Never copy the OHLC history to the persistent JSON or public API:
+        # it is used only to settle older eligible shadow candidates, as a
+        # clearly labelled candle-close reference (not a broker fill).
+        response["_paper_shadow_closed_m1"] = {
+            pd.Timestamp(idx).isoformat(): float(value)
+            for idx, value in market_data["1min"]["close"].items()
+        }
 
     return make_json_safe(response)
 
@@ -4488,6 +4733,10 @@ def api_health():
         "td_upstream_429_circuit_breaker": True,
         "stale_scan_audit": True,
         "retrospective_virtual_fills_disabled": True,
+        "m5_shadow_observation_persisted": True,
+        "m5_shadow_reference_settlement": "CLOSED_M1_CANDLE_PROXY_ONLY",
+        "m5_shadow_additional_td_credits": 0,
+        "shadow_live_and_paper_rules_unchanged": True,
     }
 
 
@@ -4792,6 +5041,13 @@ def _paper_record_scan_result(pair: str, timeframe: str, result: dict, candle_ti
             status_code=503,
             detail="Paper scan result could not be verified in storage; inspect Render server logs",
         ) from exc
+    # The baseline scan is already safely committed at this point.
+    # Shadow settlement is optional, idempotent, and never writes paper_trades.
+    if timing.get("shadow_closed_m1"):
+        try:
+            _paper_shadow_settle_pending(pair, timing["shadow_closed_m1"])
+        except Exception:
+            logger.exception("Optional M5 shadow reference settlement failed")
     return {
         **result,
         "scan_logged": True,
@@ -4799,6 +5055,8 @@ def _paper_record_scan_result(pair: str, timeframe: str, result: dict, candle_ti
         "signal_age_seconds": timing.get("signal_age_seconds"),
         "data_freshness_status": timing.get("status"),
         "max_signal_age_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS,
+        **({"shadow_observation": timing["shadow_observation"]}
+           if timing.get("shadow_observation") is not None else {}),
     }
 
 
@@ -4831,11 +5089,13 @@ def paper_monitor(limit: int = Query(default=12, ge=1, le=50)):
             item["m1_refresh"] = m1.get("m1_refresh")
             item["decision_audit"] = candles.get("_v2419_decision_audit")
             item["live_pipeline"] = candles.get("_v2419_live_pipeline")
+            item["shadow_observation"] = candles.get("_v2421_shadow")
         except (ValueError, TypeError, AttributeError):
             item["m1_provider_diagnostics"] = None
             item["m1_refresh"] = None
             item["decision_audit"] = None
             item["live_pipeline"] = None
+            item["shadow_observation"] = None
         runs.append(item)
     return {
         "version": VERSION,
@@ -4850,6 +5110,7 @@ def paper_monitor(limit: int = Query(default=12, ge=1, le=50)):
         "max_signal_age_seconds": PAPER_MAX_SIGNAL_AGE_SECONDS,
         "twelvedata_budget": _td_quota_snapshot(),
         "diagnostics_last_24_hours": _paper_query_diagnostic_summary(hours=24),
+        "shadow_last_24_hours": _paper_query_shadow_summary(hours=24),
         "note": "Shows authenticated scan calls, whether automatic or manual. Local API counters do not include other applications or worker processes. No broker execution.",
     }
 
@@ -4861,6 +5122,17 @@ def paper_diagnostics(hours: int = Query(default=24, ge=1, le=168)):
         "version": VERSION,
         "mode": "DEMO_ONLY",
         "statistics": _paper_query_diagnostic_summary(hours=hours),
+        "twelvedata_budget": _td_quota_snapshot(),
+    })
+
+
+@app.get("/api/paper/shadow", dependencies=[Depends(_paper_auth)])
+def paper_shadow(hours: int = Query(default=24, ge=1, le=168)):
+    """Authenticated, read-only M5 shadow audit; no API requests to provider."""
+    return make_json_safe({
+        "version": VERSION,
+        "mode": "DEMO_ONLY",
+        "statistics": _paper_query_shadow_summary(hours=hours),
         "twelvedata_budget": _td_quota_snapshot(),
     })
 
@@ -4887,7 +5159,9 @@ def paper_scan(req: PaperScanRequest):
         raise HTTPException(status_code=400, detail="Paper test supports 1min and 5min expiry")
 
     try:
-        signal_data = get_signal(SignalRequest(pair=pair, timeframe=timeframe))
+        signal_data = _execute_live_scan(
+            SignalRequest(pair=pair, timeframe=timeframe), shadow_capture=True
+        )
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else {}
         code = detail.get("code")
@@ -4906,6 +5180,9 @@ def paper_scan(req: PaperScanRequest):
                 "twelvedata_budget": _td_quota_snapshot(),
             }, reason=reason, timing=rejected_timing)
         raise
+    # These private fields do not exist in the public /api/signal response.
+    shadow_observation = signal_data.pop("_paper_shadow_observation", None)
+    shadow_closed_m1 = signal_data.pop("_paper_shadow_closed_m1", None)
     timing = dict(signal_data["freshness"])
     # Capture raw decision even if paper execution later marks M1 stale.
     # Never count stale snapshots as actionable signals in summary.
@@ -4917,6 +5194,14 @@ def paper_scan(req: PaperScanRequest):
     age_seconds = float((observed_at - available_at).total_seconds())
     timing["signal_age_seconds"] = round(age_seconds, 3)
     timing["observed_at_utc"] = _paper_iso(observed_at)
+    # Shadow settlement reads only candles from the already-completed scan.
+    # Failure of optional shadow analytics must never block baseline paper scans.
+    # Defer optional settlement until AFTER the baseline scan receipt commits.
+    # This prevents secondary DB processing from delaying a valid paper signal.
+    timing["shadow_closed_m1"] = shadow_closed_m1
+    timing["shadow_observation"] = _shadow_finalize_observation(
+        shadow_observation, timing, timeframe,
+    )
 
     # This also applies to WAIT scans; otherwise the monitor hides stale data.
     if age_seconds < 0 or age_seconds > PAPER_MAX_SIGNAL_AGE_SECONDS or timing["status"] != "FRESH":
